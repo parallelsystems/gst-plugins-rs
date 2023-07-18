@@ -710,6 +710,15 @@ impl VideoEncoder {
     }
 
     pub fn set_bitrate(&mut self, element: &super::WebRTCSink, bitrate: i32) {
+        gst::log!(
+            CAT,
+            obj: element,
+            "session {}: setting bitrate {} on encoder {:?}",
+            self.session_id,
+            bitrate,
+            self.element
+        );
+
         match self.factory_name.as_str() {
             "vp8enc" | "vp9enc" => self.element.set_property("target-bitrate", bitrate),
             "x264enc" | "nvh264enc" | "vaapih264enc" | "vaapivp8enc" => self
@@ -719,68 +728,6 @@ impl VideoEncoder {
                 self.element.set_property("bitrate", bitrate as u32)
             }
             factory => unimplemented!("Factory {} is currently not supported", factory),
-        }
-
-        let current_caps = self.filter.property::<gst::Caps>("caps");
-        let mut s = current_caps.structure(0).unwrap().to_owned();
-
-        // Hardcoded thresholds, may be tuned further in the future, and
-        // adapted according to the codec in use
-        if bitrate < 500000 {
-            let height = 360i32.min(self.video_info.height() as i32);
-            let width = self.scale_height_round_2(height);
-
-            s.set("height", height);
-            s.set("width", width);
-
-            if self.halved_framerate.numer() != 0 {
-                s.set("framerate", self.halved_framerate);
-            }
-
-            self.mitigation_mode =
-                WebRTCSinkMitigationMode::DOWNSAMPLED | WebRTCSinkMitigationMode::DOWNSCALED;
-        } else if bitrate < 1000000 {
-            let height = 360i32.min(self.video_info.height() as i32);
-            let width = self.scale_height_round_2(height);
-
-            s.set("height", height);
-            s.set("width", width);
-            s.remove_field("framerate");
-
-            self.mitigation_mode = WebRTCSinkMitigationMode::DOWNSCALED;
-        } else if bitrate < 2000000 {
-            let height = 720i32.min(self.video_info.height() as i32);
-            let width = self.scale_height_round_2(height);
-
-            s.set("height", height);
-            s.set("width", width);
-            s.remove_field("framerate");
-
-            self.mitigation_mode = WebRTCSinkMitigationMode::DOWNSCALED;
-        } else {
-            s.remove_field("height");
-            s.remove_field("width");
-            s.remove_field("framerate");
-
-            self.mitigation_mode = WebRTCSinkMitigationMode::NONE;
-        }
-
-        let caps = gst::Caps::builder_full_with_any_features()
-            .structure(s)
-            .build();
-
-        if !caps.is_strictly_equal(&current_caps) {
-            gst::log!(
-                CAT,
-                obj: element,
-                "session {}: setting bitrate {} and caps {} on encoder {:?}",
-                self.session_id,
-                bitrate,
-                caps,
-                self.element
-            );
-
-            self.filter.set_property("caps", caps);
         }
     }
 
