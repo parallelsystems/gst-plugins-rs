@@ -716,7 +716,7 @@ impl VideoEncoder {
             "session {}: setting bitrate {} on encoder {:?}",
             self.session_id,
             bitrate,
-            self.element
+            self.factory_name.as_str()
         );
 
         match self.factory_name.as_str() {
@@ -727,6 +727,9 @@ impl VideoEncoder {
             "nvv4l2h264enc" | "nvv4l2vp8enc" | "nvv4l2vp9enc" => {
                 self.element.set_property("bitrate", bitrate as u32);
                 self.element.set_property("peak-bitrate", bitrate as u32);
+                // todo this should be 10 fps
+                self.element
+                    .set_property("vbv-size", (bitrate as f32 * 2. / 10.) as u32);
             }
             factory => unimplemented!("Factory {} is currently not supported", factory),
         }
