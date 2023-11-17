@@ -710,6 +710,7 @@ impl VideoEncoder {
     }
 
     pub fn set_bitrate(&mut self, element: &super::WebRTCSink, bitrate: i32) {
+        println!("here setting bitrate to {bitrate}");
         gst::info!(
             CAT,
             obj: element,
