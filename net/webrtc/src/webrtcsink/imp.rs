@@ -710,7 +710,6 @@ impl VideoEncoder {
     }
 
     pub fn set_bitrate(&mut self, element: &super::WebRTCSink, bitrate: i32) {
-        println!("here setting bitrate to {bitrate}");
         gst::info!(
             CAT,
             obj: element,
@@ -726,7 +725,8 @@ impl VideoEncoder {
                 .element
                 .set_property("bitrate", (bitrate / 1000) as u32),
             "nvv4l2h264enc" | "nvv4l2vp8enc" | "nvv4l2vp9enc" => {
-                self.element.set_property("bitrate", bitrate as u32)
+                self.element.set_property("bitrate", bitrate as u32);
+                self.element.set_property("peak-bitrate", bitrate as u32);
             }
             factory => unimplemented!("Factory {} is currently not supported", factory),
         }
