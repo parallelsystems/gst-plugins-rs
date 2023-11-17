@@ -411,6 +411,13 @@ impl Detector {
         let mut rtt = Duration::nanoseconds(i64::MAX);
         let now = ts2dur(self.clock.time().unwrap());
         for packet in packets {
+            // prevent underflow, will make max duration if there is underflow
+            if now.checked_sub(&packet.departure).is_none() {
+                gst::error!(
+                    "Underflow of packet rtt! now: {now:?}, departure: {:?}",
+                    packet.departure
+                );
+            }
             rtt = (now - packet.departure).min(rtt);
         }
 
@@ -432,6 +439,7 @@ impl Detector {
     }
 
     fn update(&mut self, packets: &mut Vec<Packet>) {
+        // Update roundtrip time for every packet based on what time it is now.
         self.update_rtts(packets);
         let mut lost_packets = 0.;
         let n_packets = packets.len();
@@ -469,17 +477,20 @@ impl Detector {
 
             self.update_last_received_packets(*pkt);
 
+            // if this is the first packet of the group, record it as such and keep going
             if self.group.arrival.is_none() {
                 self.group.add(*pkt);
 
                 continue;
             }
 
+            // if this packet is out of order from the first one, ignore it
             if pkt.arrival < self.group.arrival.unwrap() {
                 // ignore out of order arrivals
                 continue;
             }
 
+            //if this one left after the last one of the group left (aka is next one in line)
             if pkt.departure >= self.group.departure {
                 if self.group.inter_departure_time_pkt(pkt) < *BURST_TIME {
                     self.group.add(*pkt);
@@ -538,6 +549,7 @@ impl Detector {
     }
 
     fn kalman_estimate(&mut self, prev_group: &PacketGroup, group: &PacketGroup) {
+        // The difference in packet group durations: old duration - new
         self.measure = group.inter_delay_variation(prev_group);
 
         let z = self.measure - self.estimate;
@@ -967,7 +979,9 @@ impl State {
             self.last_control_op =
                 BandwidthEstimationOp::Decrease(format!("High loss detected ({loss_ratio:2}"));
             self.last_decrease_on_loss = now;
-
+            gst::info!(
+                "Setting bitrate due to loss_ratio: {loss_ratio} > {LOSS_DECREASE_THRESHOLD}"
+            );
             self.set_bitrate(
                 bwe,
                 (self.target_bitrate_on_loss as f64 * factor) as Bitrate,
@@ -979,6 +993,9 @@ impl State {
             self.last_control_op = BandwidthEstimationOp::Increase("Low loss".into());
             self.last_increase_on_loss = now;
 
+            gst::info!(
+                "Setting bitrate due to loss_ratio: {loss_ratio} < {LOSS_INCREASE_THRESHOLD}"
+            );
             self.set_bitrate(
                 bwe,
                 (self.target_bitrate_on_loss as f64 * LOSS_INCREASE_FACTOR) as Bitrate,
@@ -1001,7 +1018,9 @@ impl State {
             },
             NetworkUsage::Over => {
                 let now = time::Instant::now();
+                // the detector is overusing, and the last time we saw this was more than 100ms ago
                 if now - self.last_decrease_on_delay > *DELAY_UPDATE_INTERVAL {
+                    // get the effective bitrate
                     let effective_bitrate = self.detector.effective_bitrate();
                     let target =
                         (self.estimated_bitrate as f64 * 0.95).min(BETA * effective_bitrate as f64);
