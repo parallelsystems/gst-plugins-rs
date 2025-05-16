@@ -943,31 +943,25 @@ impl VideoEncoder {
         let current_caps = self.filter.property::<gst::Caps>("caps");
         let mut s = current_caps.structure(0).unwrap().to_owned();
 
-        // Hardcoded thresholds, may be tuned further in the future, and
-        // adapted according to the codec in use
-        if bitrate < 500000 {
-            let height = 360i32.min(self.video_info.height() as i32);
+        // Hardcoded thresholds have been adapted from the values that shipped
+        // with the plugin to suit our needs.
+        //
+        // In the lowest quality mode, we still maintain 720p, but rely on downstream
+        // encoder's quantization to fit the bitrate budget.
+        if bitrate < 1_000_000 {
+            let height = 720i32.min(self.video_info.height() as i32);
             let width = self.scale_height_round_2(height);
-
-            s.set("height", height);
-            s.set("width", width);
 
             if self.halved_framerate.numer() != 0 {
                 s.set("framerate", self.halved_framerate);
             }
 
-            self.mitigation_mode =
-                WebRTCSinkMitigationMode::DOWNSAMPLED | WebRTCSinkMitigationMode::DOWNSCALED;
-        } else if bitrate < 1000000 {
-            let height = 360i32.min(self.video_info.height() as i32);
-            let width = self.scale_height_round_2(height);
-
             s.set("height", height);
             s.set("width", width);
-            s.remove_field("framerate");
 
-            self.mitigation_mode = WebRTCSinkMitigationMode::DOWNSCALED;
-        } else if bitrate < 2000000 {
+            self.mitigation_mode =
+                WebRTCSinkMitigationMode::DOWNSAMPLED | WebRTCSinkMitigationMode::DOWNSCALED;
+        } else if bitrate < 2_500_000 {
             let height = 720i32.min(self.video_info.height() as i32);
             let width = self.scale_height_round_2(height);
 
