@@ -2,113 +2,113 @@
 resolver = "2"
 
 members = [
-    "tutorial",
-    "version-helper",
+    # "tutorial",
+    # "version-helper",
 
-    "audio/audiofx",
-    "audio/claxon",
-    "audio/csound",
-    "audio/lewton",
-    "audio/spotify",
+    # "audio/audiofx",
+    # "audio/claxon",
+    # "audio/csound",
+    # "audio/lewton",
+    # "audio/spotify",
 
-    "generic/file",
-    "generic/originalbuffer",
-    "generic/sodium",
-    "generic/threadshare",
-    "generic/inter",
-    "generic/gopbuffer",
+    # "generic/file",
+    # "generic/originalbuffer",
+    # "generic/sodium",
+    # "generic/threadshare",
+    # "generic/inter",
+    # "generic/gopbuffer",
 
-    "mux/flavors",
-    "mux/fmp4",
-    "mux/mp4",
+    # "mux/flavors",
+    # "mux/fmp4",
+    # "mux/mp4",
 
-    "net/aws",
-    "net/hlssink3",
-    "net/mpegtslive",
-    "net/ndi",
-    "net/onvif",
-    "net/raptorq",
-    "net/reqwest",
-    "net/rtp",
-    "net/rtsp",
-    "net/webrtchttp",
+    # "net/aws",
+    # "net/hlssink3",
+    # "net/mpegtslive",
+    # "net/ndi",
+    # "net/onvif",
+    # "net/raptorq",
+    # "net/reqwest",
+    # "net/rtp",
+    # "net/rtsp",
+    # "net/webrtchttp",
     "net/webrtc",
     "net/webrtc/protocol",
     "net/webrtc/signalling",
-    "net/quinn",
+    # "net/quinn",
 
-    "text/ahead",
-    "text/json",
-    "text/regex",
-    "text/wrap",
+    # "text/ahead",
+    # "text/json",
+    # "text/regex",
+    # "text/wrap",
 
-    "utils/fallbackswitch",
-    "utils/livesync",
-    "utils/togglerecord",
-    "utils/tracers",
-    "utils/uriplaylistbin",
+    # "utils/fallbackswitch",
+    # "utils/livesync",
+    # "utils/togglerecord",
+    # "utils/tracers",
+    # "utils/uriplaylistbin",
 
-    "video/cdg",
-    "video/closedcaption",
-    "video/dav1d",
-    "video/ffv1",
-    "video/gif",
-    "video/gtk4",
-    "video/hsv",
-    "video/png",
-    "video/rav1e",
-    "video/videofx",
-    "video/webp",
+    # "video/cdg",
+    # "video/closedcaption",
+    # "video/dav1d",
+    # "video/ffv1",
+    # "video/gif",
+    # "video/gtk4",
+    # "video/hsv",
+    # "video/png",
+    # "video/rav1e",
+    # "video/videofx",
+    # "video/webp",
 ]
 
 # Only plugins without external dependencies
 default-members = [
-    "version-helper",
+    # "version-helper",
 
-    "audio/audiofx",
-    "audio/claxon",
-    "audio/lewton",
+    # "audio/audiofx",
+    # "audio/claxon",
+    # "audio/lewton",
 
-    "generic/originalbuffer",
-    "generic/threadshare",
-    "generic/inter",
-    "generic/gopbuffer",
+    # "generic/originalbuffer",
+    # "generic/threadshare",
+    # "generic/inter",
+    # "generic/gopbuffer",
 
-    "mux/fmp4",
-    "mux/mp4",
+    # "mux/fmp4",
+    # "mux/mp4",
 
-    "net/aws",
-    "net/mpegtslive",
-    "net/hlssink3",
-    "net/onvif",
-    "net/raptorq",
-    "net/reqwest",
-    "net/rtp",
-    "net/rtsp",
-    "net/webrtchttp",
+    # "net/aws",
+    # "net/mpegtslive",
+    # "net/hlssink3",
+    # "net/onvif",
+    # "net/raptorq",
+    # "net/reqwest",
+    # "net/rtp",
+    # "net/rtsp",
+    # "net/webrtchttp",
     "net/webrtc",
     "net/webrtc/protocol",
     "net/webrtc/signalling",
-    "net/ndi",
-    "net/quinn",
+    # "net/ndi",
+    # "net/quinn",
 
-    "text/ahead",
-    "text/json",
-    "text/regex",
-    "text/wrap",
+    # "text/ahead",
+    # "text/json",
+    # "text/regex",
+    # "text/wrap",
 
-    "utils/fallbackswitch",
-    "utils/livesync",
-    "utils/togglerecord",
-    "utils/tracers",
-    "utils/uriplaylistbin",
+    # "utils/fallbackswitch",
+    # "utils/livesync",
+    # "utils/togglerecord",
+    # "utils/tracers",
+    # "utils/uriplaylistbin",
 
-    "video/cdg",
-    "video/ffv1",
-    "video/gif",
-    "video/hsv",
-    "video/png",
-    "video/rav1e",
+    # "video/cdg",
+    # "video/ffv1",
+    # "video/gif",
+    # "video/hsv",
+    # "video/png",
+    # "video/rav1e",
 ]
 
 [profile.release]
@@ -138,21 +138,21 @@ gtk = { package = "gtk4", git = "https://github.com/gtk-rs/gtk4-rs", branch = "0
 gdk-wayland = { package = "gdk4-wayland", git = "https://github.com/gtk-rs/gtk4-rs", branch = "0.9", version = "0.9"}
 gdk-x11 = { package = "gdk4-x11", git = "https://github.com/gtk-rs/gtk4-rs", branch = "0.9", version = "0.9"}
 gdk-win32 = { package = "gdk4-win32", git = "https://github.com/gtk-rs/gtk4-rs", branch = "0.9", version = "0.9"}
-gst = { package = "gstreamer", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23.3" }
-gst-allocators = { package = "gstreamer-allocators", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23.3" }
-gst-app = { package = "gstreamer-app", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23.3" }
-gst-audio = { package = "gstreamer-audio", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23.3" }
-gst-base = { package = "gstreamer-base", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23.3" }
-gst-check = { package = "gstreamer-check", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23.2" }
-gst-gl = { package = "gstreamer-gl", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23" }
-gst-gl-egl = { package = "gstreamer-gl-egl", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23" }
-gst-gl-wayland = { package = "gstreamer-gl-wayland", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23" }
-gst-gl-x11 = { package = "gstreamer-gl-x11", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23" }
-gst-net = { package = "gstreamer-net", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23" }
-gst-pbutils = { package = "gstreamer-pbutils", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23" }
+gst = { package = "gstreamer", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-allocators = { package = "gstreamer-allocators", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-app = { package = "gstreamer-app", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-audio = { package = "gstreamer-audio", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-base = { package = "gstreamer-base", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-check = { package = "gstreamer-check", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-gl = { package = "gstreamer-gl", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-gl-egl = { package = "gstreamer-gl-egl", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-gl-wayland = { package = "gstreamer-gl-wayland", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-gl-x11 = { package = "gstreamer-gl-x11", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-net = { package = "gstreamer-net", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-pbutils = { package = "gstreamer-pbutils", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
 gst-plugin-version-helper = { path="./version-helper", version = "0.8" }
-gst-rtp = { package = "gstreamer-rtp", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23" }
-gst-sdp = { package = "gstreamer-sdp", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23" }
-gst-utils = { package = "gstreamer-utils", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23" }
-gst-video = { package = "gstreamer-video", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23" }
-gst-webrtc = { package = "gstreamer-webrtc", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", version = "0.23" }
+gst-rtp = { package = "gstreamer-rtp", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-sdp = { package = "gstreamer-sdp", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-utils = { package = "gstreamer-utils", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-video = { package = "gstreamer-video", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
+gst-webrtc = { package = "gstreamer-webrtc", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "0.23", version = "0.23" }
