@@ -92,10 +92,11 @@ pub struct CongestionController {
 
     min_bitrate: u32,
     max_bitrate: u32,
+    do_fec: bool,
 }
 
 impl CongestionController {
-    pub fn new(peer_id: &str, min_bitrate: u32, max_bitrate: u32) -> Self {
+    pub fn new(peer_id: &str, min_bitrate: u32, max_bitrate: u32, do_fec: bool) -> Self {
         Self {
             target_bitrate_on_delay: 0,
             target_bitrate_on_loss: 0,
@@ -105,6 +106,7 @@ impl CongestionController {
             peer_id: peer_id.to_string(),
             min_bitrate,
             max_bitrate,
+            do_fec,
         }
     }
 
@@ -403,11 +405,15 @@ impl CongestionController {
         }
 
         let fec_ratio = {
-            if target_bitrate <= 2000000 || self.max_bitrate <= 2000000 {
-                0f64
+            if self.do_fec {
+                if target_bitrate <= 2000000 || self.max_bitrate <= 2000000 {
+                    0f64
+                } else {
+                    (target_bitrate as f64 - 2000000f64) / (self.max_bitrate as f64 - 2000000f64)
+                }
             } else {
-                (target_bitrate as f64 - 2000000f64) / (self.max_bitrate as f64 - 2000000f64)
-            }
+                0.0
+            }   
         };
 
         let fec_percentage = (fec_ratio * 50f64) as u32;

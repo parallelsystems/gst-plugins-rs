@@ -1297,7 +1297,7 @@ impl SessionInner {
                         // If congestion control is disabled, we simply use the highest
                         // known "safe" value for the bitrate.
                         let _ = enc.set_bitrate(element, self.cc_info.max_bitrate as i32);
-                        enc.transceiver.set_property("fec-percentage", 50u32);
+                        enc.transceiver.set_property("fec-percentage", 20u32);
                     }
                     WebRTCSinkCongestionControl::Homegrown => {
                         if let Some(congestion_controller) = self.congestion_controller.as_mut() {
@@ -1311,7 +1311,7 @@ impl SessionInner {
                             /* If congestion control is disabled, we simply use the highest
                              * known "safe" value for the bitrate. */
                             let _ = enc.set_bitrate(element, self.cc_info.max_bitrate as i32);
-                            enc.transceiver.set_property("fec-percentage", 50u32);
+                            enc.transceiver.set_property("fec-percentage", 20u32);
                         }
                     }
                     _ => enc.transceiver.set_property("fec-percentage", 0u32),
@@ -2725,6 +2725,7 @@ impl BaseWebRTCSink {
                     &peer_id,
                     settings.cc_info.min_bitrate,
                     settings.cc_info.max_bitrate,
+                    settings.do_fec,
                 )),
                 _ => None,
             },
