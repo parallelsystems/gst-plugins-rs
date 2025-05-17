@@ -1116,15 +1116,15 @@ checksum = "07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f"
 
 [[package]]
 name = "gio"
-version = "0.20.11"
-source = "git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11#95018bfc15c7fa48714a0bc28c809e84d08856f2"
+version = "0.20.10"
+source = "git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.10#7a02e4f0e7c824fc1ac63b1891000ac1715bc450"
 dependencies = [
  "futures-channel",
  "futures-core",
  "futures-io",
  "futures-util",
- "gio-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11)",
- "glib 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11)",
+ "gio-sys 0.20.10",
+ "glib 0.20.10",
  "libc",
  "pin-project-lite",
  "smallvec",
@@ -1139,8 +1139,8 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-util",
- "gio-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
- "glib 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "gio-sys 0.20.11",
+ "glib 0.20.11",
  "libc",
  "pin-project-lite",
  "smallvec",
@@ -1148,11 +1148,11 @@ dependencies = [
 
 [[package]]
 name = "gio-sys"
-version = "0.20.11"
-source = "git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11#95018bfc15c7fa48714a0bc28c809e84d08856f2"
+version = "0.20.10"
+source = "git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.10#7a02e4f0e7c824fc1ac63b1891000ac1715bc450"
 dependencies = [
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11)",
- "gobject-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11)",
+ "glib-sys 0.20.10",
+ "gobject-sys 0.20.10",
  "libc",
  "system-deps",
  "windows-sys 0.52.0",
@@ -1163,8 +1163,8 @@ name = "gio-sys"
 version = "0.20.11"
 source = "git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20#95018bfc15c7fa48714a0bc28c809e84d08856f2"
 dependencies = [
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
- "gobject-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib-sys 0.20.11",
+ "gobject-sys 0.20.11",
  "libc",
  "system-deps",
  "windows-sys 0.59.0",
@@ -1172,8 +1172,8 @@ dependencies = [
 
 [[package]]
 name = "glib"
-version = "0.20.11"
-source = "git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11#95018bfc15c7fa48714a0bc28c809e84d08856f2"
+version = "0.20.10"
+source = "git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.10#7a02e4f0e7c824fc1ac63b1891000ac1715bc450"
 dependencies = [
  "bitflags 2.9.1",
  "futures-channel",
@@ -1181,10 +1181,10 @@ dependencies = [
  "futures-executor",
  "futures-task",
  "futures-util",
- "gio-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11)",
- "glib-macros 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11)",
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11)",
- "gobject-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11)",
+ "gio-sys 0.20.10",
+ "glib-macros 0.20.10",
+ "glib-sys 0.20.10",
+ "gobject-sys 0.20.10",
  "libc",
  "memchr",
  "smallvec",
@@ -1201,10 +1201,10 @@ dependencies = [
  "futures-executor",
  "futures-task",
  "futures-util",
- "gio-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
- "glib-macros 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
- "gobject-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "gio-sys 0.20.11",
+ "glib-macros 0.20.11",
+ "glib-sys 0.20.11",
+ "gobject-sys 0.20.11",
  "libc",
  "memchr",
  "smallvec",
@@ -1212,8 +1212,8 @@ dependencies = [
 
 [[package]]
 name = "glib-macros"
-version = "0.20.11"
-source = "git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11#95018bfc15c7fa48714a0bc28c809e84d08856f2"
+version = "0.20.10"
+source = "git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.10#7a02e4f0e7c824fc1ac63b1891000ac1715bc450"
 dependencies = [
  "heck 0.5.0",
  "proc-macro-crate",
@@ -1236,8 +1236,8 @@ dependencies = [
 
 [[package]]
 name = "glib-sys"
-version = "0.20.11"
-source = "git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11#95018bfc15c7fa48714a0bc28c809e84d08856f2"
+version = "0.20.10"
+source = "git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.10#7a02e4f0e7c824fc1ac63b1891000ac1715bc450"
 dependencies = [
  "libc",
  "system-deps",
@@ -1260,10 +1260,10 @@ checksum = "a8d1add55171497b4705a648c6b583acafb01d58050a51727785f0b2c8e0a2b2"
 
 [[package]]
 name = "gobject-sys"
-version = "0.20.11"
-source = "git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11#95018bfc15c7fa48714a0bc28c809e84d08856f2"
+version = "0.20.10"
+source = "git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.10#7a02e4f0e7c824fc1ac63b1891000ac1715bc450"
 dependencies = [
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11)",
+ "glib-sys 0.20.10",
  "libc",
  "system-deps",
 ]
@@ -1273,7 +1273,7 @@ name = "gobject-sys"
 version = "0.20.11"
 source = "git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20#95018bfc15c7fa48714a0bc28c809e84d08856f2"
 dependencies = [
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib-sys 0.20.11",
  "libc",
  "system-deps",
 ]
@@ -1288,7 +1288,7 @@ dependencies = [
  "byte-slice-cast",
  "chrono",
  "futures",
- "gio 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?tag=0.20.11)",
+ "gio 0.20.10",
  "gst-plugin-version-helper",
  "gstreamer",
  "gstreamer-app",
@@ -1416,7 +1416,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
- "glib 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib 0.20.11",
  "gstreamer-sys",
  "itertools 0.13.0",
  "libc",
@@ -1440,7 +1440,7 @@ source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d
 dependencies = [
  "futures-core",
  "futures-sink",
- "glib 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib 0.20.11",
  "gstreamer",
  "gstreamer-app-sys",
  "gstreamer-base",
@@ -1452,7 +1452,7 @@ name = "gstreamer-app-sys"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib-sys 0.20.11",
  "gstreamer-base-sys",
  "gstreamer-sys",
  "libc",
@@ -1465,7 +1465,7 @@ version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
  "cfg-if",
- "glib 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib 0.20.11",
  "gstreamer",
  "gstreamer-audio-sys",
  "gstreamer-base",
@@ -1480,8 +1480,8 @@ name = "gstreamer-audio-sys"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
- "gobject-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib-sys 0.20.11",
+ "gobject-sys 0.20.11",
  "gstreamer-base-sys",
  "gstreamer-sys",
  "libc",
@@ -1495,7 +1495,7 @@ source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d
 dependencies = [
  "atomic_refcell",
  "cfg-if",
- "glib 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib 0.20.11",
  "gstreamer",
  "gstreamer-base-sys",
  "libc",
@@ -1506,8 +1506,8 @@ name = "gstreamer-base-sys"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
- "gobject-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib-sys 0.20.11",
+ "gobject-sys 0.20.11",
  "gstreamer-sys",
  "libc",
  "system-deps",
@@ -1518,7 +1518,7 @@ name = "gstreamer-check"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "glib 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib 0.20.11",
  "gstreamer",
  "gstreamer-check-sys",
 ]
@@ -1528,8 +1528,8 @@ name = "gstreamer-check-sys"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
- "gobject-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib-sys 0.20.11",
+ "gobject-sys 0.20.11",
  "gstreamer-sys",
  "libc",
  "system-deps",
@@ -1540,8 +1540,8 @@ name = "gstreamer-net"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "gio 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
- "glib 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "gio 0.20.11",
+ "glib 0.20.11",
  "gstreamer",
  "gstreamer-net-sys",
 ]
@@ -1551,8 +1551,8 @@ name = "gstreamer-net-sys"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "gio-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "gio-sys 0.20.11",
+ "glib-sys 0.20.11",
  "gstreamer-sys",
  "libc",
  "system-deps",
@@ -1563,7 +1563,7 @@ name = "gstreamer-rtp"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "glib 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib 0.20.11",
  "gstreamer",
  "gstreamer-rtp-sys",
  "libc",
@@ -1574,7 +1574,7 @@ name = "gstreamer-rtp-sys"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib-sys 0.20.11",
  "gstreamer-base-sys",
  "gstreamer-sys",
  "libc",
@@ -1586,7 +1586,7 @@ name = "gstreamer-sdp"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "glib 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib 0.20.11",
  "gstreamer",
  "gstreamer-sdp-sys",
 ]
@@ -1596,7 +1596,7 @@ name = "gstreamer-sdp-sys"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib-sys 0.20.11",
  "gstreamer-sys",
  "libc",
  "system-deps",
@@ -1607,8 +1607,8 @@ name = "gstreamer-sys"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
- "gobject-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib-sys 0.20.11",
+ "gobject-sys 0.20.11",
  "libc",
  "system-deps",
 ]
@@ -1632,7 +1632,7 @@ source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d
 dependencies = [
  "cfg-if",
  "futures-channel",
- "glib 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib 0.20.11",
  "gstreamer",
  "gstreamer-base",
  "gstreamer-video-sys",
@@ -1647,8 +1647,8 @@ name = "gstreamer-video-sys"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
- "gobject-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib-sys 0.20.11",
+ "gobject-sys 0.20.11",
  "gstreamer-base-sys",
  "gstreamer-sys",
  "libc",
@@ -1660,7 +1660,7 @@ name = "gstreamer-webrtc"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "glib 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib 0.20.11",
  "gstreamer",
  "gstreamer-sdp",
  "gstreamer-webrtc-sys",
@@ -1672,7 +1672,7 @@ name = "gstreamer-webrtc-sys"
 version = "0.23.3"
 source = "git+https://gitlab.freedesktop.org/gstreamer/gstreamer-rs?tag=0.23.3#d3593c86b68713db561ed53118060b1f5a2abeb0"
 dependencies = [
- "glib-sys 0.20.11 (git+https://github.com/gtk-rs/gtk-rs-core?branch=0.20)",
+ "glib-sys 0.20.11",
  "gstreamer-sdp-sys",
  "gstreamer-sys",
  "libc",
