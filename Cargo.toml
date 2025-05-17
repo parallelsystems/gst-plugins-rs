@@ -129,8 +129,8 @@ rust-version = "1.71"
 
 [workspace.dependencies]
 once_cell = "1"
-glib = { git = "https://github.com/gtk-rs/gtk-rs-core", tag = "0.20.10" }
-gio = { git = "https://github.com/gtk-rs/gtk-rs-core", tag = "0.20.10" }
+glib = { git = "https://github.com/gtk-rs/gtk-rs-core", tag = "0.20.11" }
+gio = { git = "https://github.com/gtk-rs/gtk-rs-core", tag = "0.20.11" }
 # cairo-rs = { git = "https://github.com/gtk-rs/gtk-rs-core", tag = "0.20.10", features=["use_glib"] }
 # pango = { git = "https://github.com/gtk-rs/gtk-rs-core", tag = "0.20.10" }
 # pangocairo = { git = "https://github.com/gtk-rs/gtk-rs-core", tag = "0.20.10" }
