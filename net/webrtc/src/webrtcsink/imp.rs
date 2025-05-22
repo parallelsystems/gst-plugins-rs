@@ -47,6 +47,11 @@ const RTP_TWCC_URI: &str =
 const DEFAULT_STUN_SERVER: Option<&str> = Some("stun://stun.l.google.com:19302");
 const DEFAULT_MIN_BITRATE: u32 = 1000;
 
+/// Below this bitrate, the encoder will use half-framerate
+pub(crate) const LOW_FRAMERATE_THRESHOLD_BITRATE: i32 = 1_000_000;
+/// Below this bitrate, the encoder will be 720 at full FPS
+pub(crate) const NOMINAL_THRESHOLD_BITRATE: i32 = 2_500_000;
+
 /* I have found higher values to cause packet loss *somewhere* in
  * my local network, possibly related to chrome's pretty low UDP
  * buffer sizes */
@@ -274,6 +279,7 @@ struct SessionInner {
     rtpgccbwe: Option<gst::Element>,
 
     sdp: Option<gst_sdp::SDPMessage>,
+    // This is weird - can contain `webrtcbin::get-stats` or `rtpbin::twcc-stats`?
     stats: gst::Structure,
 
     cc_info: CCInfo,
@@ -948,7 +954,7 @@ impl VideoEncoder {
         //
         // In the lowest quality mode, we still maintain 720p, but rely on downstream
         // encoder's quantization to fit the bitrate budget.
-        if bitrate < 1_000_000 {
+        if bitrate < LOW_FRAMERATE_THRESHOLD_BITRATE {
             let height = 720i32.min(self.video_info.height() as i32);
             let width = self.scale_height_round_2(height);
 
@@ -961,7 +967,7 @@ impl VideoEncoder {
 
             self.mitigation_mode =
                 WebRTCSinkMitigationMode::DOWNSAMPLED | WebRTCSinkMitigationMode::DOWNSCALED;
-        } else if bitrate < 2_500_000 {
+        } else if bitrate < NOMINAL_THRESHOLD_BITRATE {
             let height = 720i32.min(self.video_info.height() as i32);
             let width = self.scale_height_round_2(height);
 
@@ -1123,6 +1129,19 @@ impl SessionInner {
         }
     }
 
+    fn congestion_controller_stats(&self) -> gst::Structure {
+        let (br, loss, delay) = if let Some(cc) = &self.congestion_controller {
+            (cc.target_bitrate, cc.target_bitrate_on_delay, cc.target_bitrate_on_loss)
+        } else {
+            (0, 0, 0)
+        };
+        gst::Structure::builder("application/x-webrtcsink-congestion-controller-stats")
+            .field("target-bitrate", br)
+            .field("loss-control-bitrate", loss)
+            .field("delay-control-bitrate", delay)
+            .build()
+    }
+
     fn gather_stats(&self) -> gst::Structure {
         let mut ret = self.stats.to_owned();
 
@@ -1135,6 +1154,7 @@ impl SessionInner {
 
         let our_stats = gst::Structure::builder("application/x-webrtcsink-consumer-stats")
             .field("video-encoders", encoder_stats)
+            .field("congestion-controller", self.congestion_controller_stats())
             .build();
 
         ret.set("consumer-stats", our_stats);
@@ -1296,9 +1316,9 @@ impl SessionInner {
                     WebRTCSinkCongestionControl::Homegrown => {
                         if let Some(congestion_controller) = self.congestion_controller.as_mut() {
                             if let Ok(bitrate) = enc.bitrate() {
-                                congestion_controller.target_bitrate_on_delay += bitrate;
-                                congestion_controller.target_bitrate_on_loss =
-                                    congestion_controller.target_bitrate_on_delay;
+                                congestion_controller.target_bitrate_on_delay = bitrate;
+                                congestion_controller.target_bitrate_on_loss = bitrate;
+                                congestion_controller.target_bitrate = bitrate;
                                 enc.transceiver.set_property("fec-percentage", 0u32);
                             }
                         } else {
@@ -2755,11 +2775,15 @@ impl BaseWebRTCSink {
                                     glib::clone!(
                                         #[weak]
                                         element,
-                                        move |sess, pspec| {
+                                        move |sess, _pspec| {
+                                            let session_stats = sess.property::<gst::Structure>("stats");
+                                            let twcc_stats = sess.property::<gst::Structure>("twcc-stats");
                                             // Run the Loss-based control algorithm on new peer TWCC feedbacks
                                             element.imp().process_loss_stats(
                                                 &session_id_str,
-                                                &sess.property::<gst::Structure>(pspec.name()),
+                                                &session_stats,
+                                                &twcc_stats
+                                                // &sess.property::<gst::Structure>(pspec.name()),
                                             );
                                         }
                                     ),
@@ -3015,16 +3039,17 @@ impl BaseWebRTCSink {
         Ok(())
     }
 
-    fn process_loss_stats(&self, session_id: &str, stats: &gst::Structure) {
+    fn process_loss_stats(&self, session_id: &str, session_stats: &gst::Structure, twcc_stats: &gst::Structure) {
         let mut state = self.state.lock().unwrap();
         if let Some(session) = state.sessions.get_mut(session_id) {
             /* We need this two-step approach for split-borrowing */
             let mut session_guard = session.0.lock().unwrap();
             let session = session_guard.deref_mut();
             if let Some(congestion_controller) = session.congestion_controller.as_mut() {
-                congestion_controller.loss_control(&self.obj(), stats, &mut session.encoders);
+                congestion_controller.loss_control(&self.obj(), session_stats, twcc_stats, &mut session.encoders);
             }
-            stats.clone_into(&mut session.stats);
+
+            twcc_stats.clone_into(&mut session.stats);
         }
     }
 
