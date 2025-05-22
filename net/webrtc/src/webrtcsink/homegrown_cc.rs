@@ -98,15 +98,19 @@ pub struct CongestionController {
     min_bitrate: u32,
     max_bitrate: u32,
     do_fec: bool,
+
+    /// List of packet loss reported by the loss controller;
+    /// drained whenever stats are generated
+    losses: Vec<f64>
 }
 
 /// Exponential Moving Average weights
 /// 0.95 is recommended; [0,1] higher = more weight on recent measurements
 const SMOOTHING_FACTOR: f64 = 0.85;
-// /// Inter-packet spacing at 20FPS (50 msec on avg)
-// const PKT_DELTA_OF_DELTAS_FULL_FPS_NSEC: i64 = 1_000_000;
-// /// Inter-packet spacing at 10FPS (100 msec on avg)
-// const PKT_DELTA_OF_DELTAS_LOW_FPS_NSEC: i64 = 2_000_000;
+/// Inter-packet spacing at 20FPS (50 msec on avg)
+const PKT_DELTA_OF_DELTAS_FULL_FPS_NSEC: i64 = 1_000_000;
+/// Inter-packet spacing at 10FPS (100 msec on avg)
+const PKT_DELTA_OF_DELTAS_LOW_FPS_NSEC: i64 = 2_000_000;
 /// The number of std-deviations to use as a range for the EMA
 const NUM_STD_DEV_EMA: f64 = 3.0;
 
@@ -123,6 +127,7 @@ impl CongestionController {
             min_bitrate,
             max_bitrate,
             do_fec,
+            losses: vec![]
         }
     }
 
@@ -157,11 +162,11 @@ impl CongestionController {
         let delay_factor = sent_minus_received as f64 / target_bitrate;
         let last_update_time = self.last_update_time.replace(std::time::Instant::now());
 
-        // let threshold_delta_of_deltas = if target_bitrate < (LOW_FRAMERATE_THRESHOLD_BITRATE as f64) {
-        //     PKT_DELTA_OF_DELTAS_LOW_FPS_NSEC
-        // } else {
-        //     PKT_DELTA_OF_DELTAS_FULL_FPS_NSEC
-        // };
+        let threshold_delta_of_deltas = if target_bitrate < (LOW_FRAMERATE_THRESHOLD_BITRATE as f64) {
+            PKT_DELTA_OF_DELTAS_LOW_FPS_NSEC
+        } else {
+            PKT_DELTA_OF_DELTAS_FULL_FPS_NSEC
+        };
 
         // If we've lost >10%
         if delay_factor > 0.1 {
@@ -179,12 +184,12 @@ impl CongestionController {
             gst::warning!(CAT, "Delay factor {factor} -- decreasing");
 
             CongestionControlOp::Decrease { factor, reason }
-        // } else if delta_of_delta > threshold_delta_of_deltas {
-        //     gst::warning!(CAT, "Interpacket delta-of-deltas exceeded threshold {threshold_delta_of_deltas} -> {delta_of_delta} ns");
-        //     CongestionControlOp::Decrease {
-        //         factor: 0.97,
-        //         reason: format!("High delta: {delta_of_delta}"),
-        //     }
+        } else if delta_of_delta > threshold_delta_of_deltas {
+            gst::warning!(CAT, "Interpacket delta-of-deltas exceeded threshold {threshold_delta_of_deltas} -> {delta_of_delta} ns");
+            CongestionControlOp::Decrease {
+                factor: 0.97,
+                reason: format!("High delta: {delta_of_delta}"),
+            }
         } else {
             // Exponential moving average
             let t = if let Some(ema) = self.bitrate_ema {
@@ -312,21 +317,12 @@ impl CongestionController {
     pub fn loss_control(
         &mut self,
         element: &super::BaseWebRTCSink,
-        session_stats: &gst::StructureRef,
+        _session_stats: &gst::StructureRef,
         twcc_stats: &gst::StructureRef,
         encoders: &mut [VideoEncoder],
     ) {
-        gst::warning!(
-            CAT,
-            "LOSS controller - SESSION {session_stats:?}",
-        );
-        gst::warning!(
-            CAT,
-            "LOSS controller - TWCC {twcc_stats:?}",
-        );
-
-
         let twcc_loss_percentage = twcc_stats.get::<f64>("packet-loss-pct").unwrap();
+        self.losses.push(twcc_loss_percentage);
 
         gst::warning!(
             CAT,
@@ -466,6 +462,16 @@ impl CongestionController {
                     .transceiver
                     .set_property("fec-percentage", fec_percentage);
             }
+        }
+    }
+
+    pub fn average_losses(&mut self) -> f64 {
+        let len = self.losses.len();
+        if len > 0 {
+            let aggregate: f64 = self.losses.drain(..).sum();
+            aggregate / (len as f64)
+        } else {
+            0.
         }
     }
 }

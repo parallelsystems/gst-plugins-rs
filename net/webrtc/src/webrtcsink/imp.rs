@@ -1129,20 +1129,21 @@ impl SessionInner {
         }
     }
 
-    fn congestion_controller_stats(&self) -> gst::Structure {
-        let (br, loss, delay) = if let Some(cc) = &self.congestion_controller {
-            (cc.target_bitrate, cc.target_bitrate_on_delay, cc.target_bitrate_on_loss)
+    fn congestion_controller_stats(&mut self) -> gst::Structure {
+        let (br, loss, delay, avg_loss_pct) = if let Some(cc) = self.congestion_controller.as_mut() {
+            (cc.target_bitrate, cc.target_bitrate_on_delay, cc.target_bitrate_on_loss, cc.average_losses())
         } else {
-            (0, 0, 0)
+            (0, 0, 0, 0.)
         };
         gst::Structure::builder("application/x-webrtcsink-congestion-controller-stats")
             .field("target-bitrate", br)
             .field("loss-control-bitrate", loss)
             .field("delay-control-bitrate", delay)
+            .field("avg-twcc-packet-loss", avg_loss_pct)
             .build()
     }
 
-    fn gather_stats(&self) -> gst::Structure {
+    fn gather_stats(&mut self) -> gst::Structure {
         let mut ret = self.stats.to_owned();
 
         let encoder_stats = self
