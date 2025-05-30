@@ -945,11 +945,6 @@ impl VideoEncoder {
         }
 
         if element.property("do-dynamic-decimation") {
-            gst::trace!(
-                CAT,
-                obj = element,
-                "doing dynamic resolution/framerate"
-            );
             let current_caps = self.filter.property::<gst::Caps>("caps");
             let mut s = current_caps.structure(0).unwrap().to_owned();
 
@@ -1005,12 +1000,6 @@ impl VideoEncoder {
 
                 self.filter.set_property("caps", caps);
             }
-        } else {
-            gst::trace!(
-                CAT,
-                obj = element,
-                "not doing dynamic resolution/framerate"
-            );
         }
 
         Ok(())
