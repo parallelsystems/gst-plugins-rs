@@ -287,6 +287,9 @@ struct SessionInner {
     codecs: Option<BTreeMap<i32, Codec>>,
 
     stats_collection_handle: Option<tokio::task::JoinHandle<()>>,
+
+    // The Datachannel, if it's part of the SDP
+    data_channel: Option<WebRTCDataChannel>,
 }
 
 #[derive(Clone)]
@@ -1126,6 +1129,7 @@ impl SessionInner {
             stats_sigid: None,
             codecs: None,
             stats_collection_handle: None,
+            data_channel: None,
         }
     }
 
@@ -1146,6 +1150,11 @@ impl SessionInner {
         ret.set("consumer-stats", our_stats);
 
         ret
+    }
+
+    fn on_data_channel(&mut self, element: &super::BaseWebRTCSink, data_channel: glib::Object) {
+        gst::info!(CAT, obj = element, "Adding data channel to session for {}", self.peer_id);
+        self.data_channel = data_channel.dynamic_cast::<WebRTCDataChannel>().ok();
     }
 
     /// Called when we have received an answer, connects an InputStream
@@ -1999,8 +2008,27 @@ impl BaseWebRTCSink {
                 "session-requested",
                 false,
                 glib::closure!(#[watch] instance, move |_signaler: glib::Object, session_id: &str, peer_id: &str, offer: Option<&gst_webrtc::WebRTCSessionDescription>|{
-                    if let Err(err) = instance.imp().start_session(session_id, peer_id, offer) {
-                        gst::warning!(CAT, obj = instance, "{}", err);
+                    // TODO: better control over the kind of session...
+                    if let Some(remote_offer) = offer {
+                        gst::warning!(CAT, obj = instance, "Creating (remote offer-based) session based {session_id}/{peer_id} {remote_offer:?}");
+                        // let Ok((answer_promise, webrtcbin)) = instance.imp().start_offer_based_session(session_id, peer_id, remote_offer) else {
+                        //     gst::warning!(CAT, obj = instance, "Unable to create offer-based session {session_id}/{peer_id}");
+                        //     return;
+                        // };
+                        // webrtcbin.emit_by_name::<()>(
+                        //     "create-answer",
+                        //     &[&None::<gst::Structure>, &answer_promise],
+                        // );
+                        // if let Err(err) = instance.imp().start_offer_based_session(session_id, peer_id, remote_offer) {
+                        if let Err(err) = instance.imp().start_headless_session(session_id, peer_id) {
+                            gst::warning!(CAT, obj = instance, "Unable to create offer-based session {session_id}/{peer_id}: {err}");
+                            return;
+                        };
+                    } else {
+                        gst::warning!(CAT, obj = instance, "Creating session from local offer generation {session_id}/{peer_id}");
+                        if let Err(err) = instance.imp().start_session(session_id, peer_id, offer) {
+                            gst::warning!(CAT, obj = instance, "{}", err);
+                        }
                     }
                 }),
             ),
@@ -2014,9 +2042,16 @@ impl BaseWebRTCSink {
                         session_description: &gst_webrtc::WebRTCSessionDescription| {
 
                         if session_description.type_() == gst_webrtc::WebRTCSDPType::Answer {
+                            gst::warning!(CAT, obj = instance, "Got remote SDP (ANSWER)");
                             instance.imp().handle_sdp_answer(session_id, session_description);
                         } else {
-                            gst::error!(CAT, obj = instance, "Unsupported SDP Type");
+                            gst::warning!(CAT, obj = instance, "Got remote SDP (OFFER)");
+                            let (promise, webrtcbin) = instance.imp().handle_sdp_offer(session_id, session_description).unwrap();
+                            gst::warning!(CAT, obj = instance, "Created promise for remote SDP offer - creating answer via promise");
+                            webrtcbin.emit_by_name::<()>(
+                                "create-answer",
+                                &[&None::<gst::Structure>, &promise],
+                            );
                         }
                     }
                 ),
@@ -2145,6 +2180,91 @@ impl BaseWebRTCSink {
             drop(session);
 
             self.on_remote_description_set(&session_id)
+        }
+    }
+
+    fn on_answer_created_promise(&self, promise_reply: Result<Option<&gst::StructureRef>, gst::PromiseError>, session_id: &str) {
+        let state = self.state.lock().unwrap();
+        let session_id = session_id.to_string();
+        if let Some(session) = state.sessions.get(&session_id) {
+            gst::info!(
+                CAT,
+                imp = self,
+                "Checking SDP Offer answer promise (session {})",
+                session_id
+            );
+
+            let reply = match promise_reply {
+                Ok(Some(reply)) => {
+                    if !reply.has_field_with_type(
+                        "answer",
+                        gst_webrtc::WebRTCSessionDescription::static_type(),
+                    ) {
+                        gst::element_error!(
+                            self.obj(),
+                            gst::StreamError::Failed,
+                            ["create-answer::Promise returned with no reply"]
+                        );
+                        return;
+                    } else if reply.has_field_with_type("error", glib::Error::static_type()) {
+                        gst::element_error!(
+                            self.obj(),
+                            gst::LibraryError::Failed,
+                            ["create-offer::Promise returned with error: {:?}", reply]
+                        );
+                        return;
+                    }
+
+                    reply
+                }
+                Ok(None) => {
+                    gst::element_error!(
+                        self.obj(),
+                        gst::StreamError::Failed,
+                        ["create-answer::Promise returned with no reply"]
+                    );
+
+                    return;
+                }
+                Err(err) => {
+                    gst::element_error!(
+                        self.obj(),
+                        gst::LibraryError::Failed,
+                        ["create-answer::Promise returned with error {:?}", err]
+                    );
+
+                    return;
+                }
+            };
+
+            let answer = reply
+                .value("answer")
+                .unwrap()
+                .get::<gst_webrtc::WebRTCSessionDescription>()
+                .expect("Invalid argument");
+
+            gst::info!(
+                CAT,
+                imp = self,
+                "Giving SDP Answer to WebRTCBin to set local-description (session {})",
+                session_id
+            );
+
+            let webrtcbin = session.0.lock().unwrap().webrtcbin.clone();
+            webrtcbin.emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
+
+            gst::info!(
+                CAT,
+                imp = self,
+                "Giving SDP Answer to Signaller to send to remote (session {})",
+                session_id
+            );
+
+            let signaller = {
+                let settings = self.settings.lock().unwrap();
+                settings.signaller.clone()
+            };
+            signaller.send_sdp(&session_id, &answer);
         }
     }
 
@@ -2430,6 +2550,223 @@ impl BaseWebRTCSink {
         let signaller = settings.signaller.clone();
         drop(settings);
         signaller.add_ice(&session_id, &candidate, sdp_m_line_index, None)
+    }
+
+    /// Called by the signaller to add a new session without the bells and whistles for video-related discovery.
+    /// Sets the webrtcbin to `PLAYING` after instantiation and storing in session state.
+    // fn start_offer_based_session(
+    fn start_headless_session(
+        &self,
+        session_id: &str,
+        peer_id: &str,
+        // offer: &gst_webrtc::WebRTCSessionDescription,
+    // ) -> Result<(gst::Promise, gst::Bin), WebRTCSinkError> {
+    ) -> Result<(), WebRTCSinkError> {
+        let settings = self.settings.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+
+        let session_id = session_id.to_string();
+
+        if state.sessions.contains_key(&session_id) {
+            return Err(WebRTCSinkError::DuplicateSessionId(session_id));
+        }
+
+        let pipeline = gst::Pipeline::builder()
+            .name(format!("session-pipeline-{session_id}"))
+            .build();
+
+        self.obj()
+            .emit_by_name::<()>("consumer-pipeline-created", &[&peer_id, &pipeline]);
+
+        let peer_id = peer_id.to_string();
+        let element = self.obj().clone();
+
+        gst::info!(
+            CAT,
+            obj = element,
+            "Adding headless session: {} for peer: {}",
+            session_id,
+            peer_id,
+        );
+
+        let webrtcbin = make_element("webrtcbin", Some(&format!("webrtcbin-{session_id}")))
+            .map_err(|err| WebRTCSinkError::SessionPipelineError {
+                session_id: session_id.clone(),
+                peer_id: peer_id.clone(),
+                details: err.to_string(),
+            })?;
+        // let webrtcbin_bin = webrtcbin.clone().downcast::<gst::Bin>().unwrap();
+
+        webrtcbin.set_property_from_str("bundle-policy", "max-bundle");
+        webrtcbin.set_property("ice-transport-policy", settings.ice_transport_policy);
+
+        if let Some(stun_server) = settings.stun_server.as_ref() {
+            webrtcbin.set_property("stun-server", stun_server);
+        }
+
+        for turn_server in settings.turn_servers.iter() {
+            webrtcbin.emit_by_name::<bool>("add-turn-server", &[&turn_server]);
+        }
+
+        pipeline.add(&webrtcbin).unwrap();
+
+        webrtcbin.connect_closure(
+            "on-ice-candidate",
+            false,
+            glib::closure!(
+                #[watch]
+                element,
+                #[strong]
+                session_id,
+                move |_webrtcbin: &gst::Element, sdp_m_line_index: u32, candidate: String| {
+                    let this = element.imp();
+                    this.on_ice_candidate(session_id.to_string(), sdp_m_line_index, candidate);
+                }
+            ),
+        );
+
+        webrtcbin.connect_notify(
+            Some("connection-state"),
+            glib::clone!(
+                #[weak]
+                element,
+                #[strong]
+                peer_id,
+                #[strong]
+                session_id,
+                move |webrtcbin, _pspec| {
+                    let state = webrtcbin
+                        .property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
+
+                    match state {
+                        gst_webrtc::WebRTCPeerConnectionState::Failed => {
+                            let this = element.imp();
+                            gst::warning!(
+                                CAT,
+                                obj = element,
+                                "Connection state for in session {} (peer {}) failed",
+                                session_id,
+                                peer_id
+                            );
+                            let _ = this.remove_session(&session_id, true);
+                        }
+                        _ => {
+                            gst::log!(
+                                CAT,
+                                obj = element,
+                                "Connection state in session {} (peer {}) changed: {:?}",
+                                session_id,
+                                peer_id,
+                                state
+                            );
+                        }
+                    }
+                }
+            ),
+        );
+
+        webrtcbin.connect_notify(
+            Some("ice-connection-state"),
+            glib::clone!(
+                #[weak]
+                element,
+                #[strong]
+                peer_id,
+                #[strong]
+                session_id,
+                move |webrtcbin, _pspec| {
+                    let state = webrtcbin
+                        .property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
+                    let this = element.imp();
+
+                    match state {
+                        gst_webrtc::WebRTCICEConnectionState::Failed => {
+                            gst::warning!(
+                                CAT,
+                                obj = element,
+                                "Ice connection state in session {} (peer {}) failed",
+                                session_id,
+                                peer_id,
+                            );
+                            let _ = this.remove_session(&session_id, true);
+                        }
+                        _ => {
+                            gst::log!(
+                                CAT,
+                                obj = element,
+                                "Ice connection state in session {} (peer {}) changed: {:?}",
+                                session_id,
+                                peer_id,
+                                state
+                            );
+                        }
+                    }
+                }
+            ),
+        );
+
+        webrtcbin.connect_closure(
+            "on-data-channel",
+            false,
+            glib::closure!(
+                #[watch]
+                element,
+                #[to_owned]
+                session_id,
+                move |_webrtcbin: gst::Bin, data_channel: glib::Object| {
+                    let this = element.imp();
+                    let mut state = this.state.lock().unwrap();
+
+                    let Some(session) = state.sessions.get_mut(&session_id) else {
+                        gst::error!(CAT, imp = this, "session {session_id:?} not found");
+                        return;
+                    };
+
+                    session.0.lock().unwrap().on_data_channel(&this.obj(), data_channel);
+                }
+            ),
+        );
+
+        gst::info!(
+            CAT,
+            obj = element,
+            "Setting session: {} pipeline --> PLAYING",
+            session_id,
+        );
+        if let Err(e) = pipeline.set_state(gst::State::Playing) {
+            return Err(WebRTCSinkError::SessionPipelineError { session_id, peer_id, details: format!("{e:?}") });
+        }
+
+
+        let session = SessionInner::new(
+            session_id.clone(),
+            pipeline.clone(),
+            webrtcbin.clone(),
+            peer_id.clone(),
+            None,
+            None,
+            settings.cc_info,
+        );
+        state.sessions.insert(
+            session_id.clone(),
+            Session(Arc::new(Mutex::new(session))),
+        );
+
+        // webrtcbin.emit_by_name::<()>("set-remote-description", &[&offer, &None::<gst::Promise>]);
+
+        // // Return a promise to the call site since we cannot hold the lock here
+        // let promise = gst::Promise::with_change_func(glib::clone!(
+        //     #[weak(rename_to = this)]
+        //     self,
+        //     #[strong]
+        //     session_id,
+        //     move |reply| {
+        //         this.on_answer_created_promise(reply, &session_id);
+        //     }
+        // ));
+
+        // Ok((promise, webrtcbin_bin))
+        Ok(())
     }
 
     /// Called by the signaller to add a new session
@@ -2995,6 +3332,7 @@ impl BaseWebRTCSink {
         Ok(())
     }
 
+
     /// Called by the signaller to remove a consumer
     fn remove_session(&self, session_id: &str, signal: bool) -> Result<(), WebRTCSinkError> {
         let settings = self.settings.lock().unwrap();
@@ -3324,6 +3662,52 @@ impl BaseWebRTCSink {
         } else {
             gst::warning!(CAT, imp = self, "No consumer with ID {session_id}");
         }
+    }
+
+    /// Meant to set the remote SDP Offer for a TextRoom connection.
+    /// This is called from the `session-description` closure after `session-requested`.
+    ///
+    /// Returns a promise for use with `create-answer` at the call site.
+    fn handle_sdp_offer(&self, session_id: &str, offer: &gst_webrtc::WebRTCSessionDescription) -> Result<(gst::Promise, gst::Bin), WebRTCSinkError>{
+        let state = self.state.lock().unwrap();
+
+        let session_id_str = session_id.to_string();
+        gst::info!(CAT, obj = self.obj(), "Got session {session_id_str:?} -- setting (remote) SDP offer");
+        let Some(session) = state.sessions.get(&session_id_str) else {
+            gst::error!(CAT, obj = self.obj(), "no session {session_id_str:?}");
+            return Err(WebRTCSinkError::NoSessionWithId(session_id_str));
+        };
+
+        let session = session.0.lock().unwrap();
+        let webrtcbin = session.webrtcbin.clone();
+
+        gst::info!(CAT, obj = self.obj(), "Setting (remote) SDP offer for {session_id_str}");
+        webrtcbin.emit_by_name::<()>("set-remote-description", &[&offer, &None::<gst::Promise>]);
+
+        let webrtcbin = webrtcbin.downcast::<gst::Bin>().unwrap();
+
+        // Return a promise to the call site since we cannot hold the lock here
+        let promise = gst::Promise::with_change_func(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[strong(rename_to = session_id)]
+            session_id_str,
+            move |reply| {
+                {
+                    let state = this.state.lock().unwrap();
+                    gst::info!(CAT, obj = this.obj(), "got answer for session {session_id:?}");
+
+                    let Some(_session) = state.sessions.get(&session_id) else {
+                        gst::error!(CAT, obj = this.obj(), "no session {session_id:?}");
+                        return;
+                    };
+                }
+
+                this.on_answer_created_promise(reply, &session_id);
+            }
+        ));
+
+        Ok((promise, webrtcbin))
     }
 
     async fn run_discovery_pipeline(
