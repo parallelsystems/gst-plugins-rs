@@ -2562,13 +2562,12 @@ impl BaseWebRTCSink {
         // offer: &gst_webrtc::WebRTCSessionDescription,
     // ) -> Result<(gst::Promise, gst::Bin), WebRTCSinkError> {
     ) -> Result<(), WebRTCSinkError> {
-        let settings = self.settings.lock().unwrap();
-        let mut state = self.state.lock().unwrap();
-
         let session_id = session_id.to_string();
-
-        if state.sessions.contains_key(&session_id) {
-            return Err(WebRTCSinkError::DuplicateSessionId(session_id));
+        {
+            let state = self.state.lock().unwrap();
+            if state.sessions.contains_key(&session_id) {
+                return Err(WebRTCSinkError::DuplicateSessionId(session_id));
+            }
         }
 
         let pipeline = gst::Pipeline::builder()
@@ -2595,17 +2594,19 @@ impl BaseWebRTCSink {
                 peer_id: peer_id.clone(),
                 details: err.to_string(),
             })?;
-        // let webrtcbin_bin = webrtcbin.clone().downcast::<gst::Bin>().unwrap();
 
-        webrtcbin.set_property_from_str("bundle-policy", "max-bundle");
-        webrtcbin.set_property("ice-transport-policy", settings.ice_transport_policy);
+        {
+            let settings = self.settings.lock().unwrap();
+            webrtcbin.set_property_from_str("bundle-policy", "max-bundle");
+            webrtcbin.set_property("ice-transport-policy", settings.ice_transport_policy);
 
-        if let Some(stun_server) = settings.stun_server.as_ref() {
-            webrtcbin.set_property("stun-server", stun_server);
-        }
+            if let Some(stun_server) = settings.stun_server.as_ref() {
+                webrtcbin.set_property("stun-server", stun_server);
+            }
 
-        for turn_server in settings.turn_servers.iter() {
-            webrtcbin.emit_by_name::<bool>("add-turn-server", &[&turn_server]);
+            for turn_server in settings.turn_servers.iter() {
+                webrtcbin.emit_by_name::<bool>("add-turn-server", &[&turn_server]);
+            }
         }
 
         pipeline.add(&webrtcbin).unwrap();
@@ -2730,13 +2731,32 @@ impl BaseWebRTCSink {
         gst::info!(
             CAT,
             obj = element,
+            "Setting session: {} pipeline --> READY",
+            session_id,
+        );
+        // Go to READY
+        if let Err(e) = pipeline.set_state(gst::State::Ready) {
+            return Err(WebRTCSinkError::SessionPipelineError { session_id, peer_id, details: format!("{e:?}") });
+        }
+
+        let (signaller_cl, cc_info_cl) = {
+            let s = self.settings.lock().unwrap();
+            (s.signaller.clone(), s.cc_info)
+        };
+
+        // Let the parent know that this bin is ready
+        signaller_cl.emit_by_name::<()>("webrtcbin-ready", &[&peer_id, &webrtcbin]);
+
+        // Now go to PLAYING
+        gst::info!(
+            CAT,
+            obj = element,
             "Setting session: {} pipeline --> PLAYING",
             session_id,
         );
         if let Err(e) = pipeline.set_state(gst::State::Playing) {
             return Err(WebRTCSinkError::SessionPipelineError { session_id, peer_id, details: format!("{e:?}") });
         }
-
 
         let session = SessionInner::new(
             session_id.clone(),
@@ -2745,27 +2765,17 @@ impl BaseWebRTCSink {
             peer_id.clone(),
             None,
             None,
-            settings.cc_info,
-        );
-        state.sessions.insert(
-            session_id.clone(),
-            Session(Arc::new(Mutex::new(session))),
+            cc_info_cl,
         );
 
-        // webrtcbin.emit_by_name::<()>("set-remote-description", &[&offer, &None::<gst::Promise>]);
+        {
+            let mut state = self.state.lock().unwrap();
+            state.sessions.insert(
+                session_id.clone(),
+                Session(Arc::new(Mutex::new(session))),
+            );
+        }
 
-        // // Return a promise to the call site since we cannot hold the lock here
-        // let promise = gst::Promise::with_change_func(glib::clone!(
-        //     #[weak(rename_to = this)]
-        //     self,
-        //     #[strong]
-        //     session_id,
-        //     move |reply| {
-        //         this.on_answer_created_promise(reply, &session_id);
-        //     }
-        // ));
-
-        // Ok((promise, webrtcbin_bin))
         Ok(())
     }
 
