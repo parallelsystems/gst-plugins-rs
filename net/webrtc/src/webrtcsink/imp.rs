@@ -4819,12 +4819,13 @@ pub(super) mod janus {
 
 pub(super) mod parallel {
     use super::*;
-
     #[derive(Default)]
     pub struct PSWebRTCSink {}
 
     impl PSWebRTCSink {
         fn connect_signaller(&self, signaller: &Signallable) {
+            println!("*** TESTING ***");
+
             let this = &*self.obj();
             let baseclass = this
                 .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()

@@ -116,6 +116,19 @@ impl BaseWebRTCSink {
     }
 }
 
+impl ParallelWebRTCSink {
+    pub fn with_signaller(signaller: Signallable) -> anyhow::Result<Self> {
+        let this: ParallelWebRTCSink = glib::Object::new();
+
+        let baseclass = this
+                .upcast_ref::<BaseWebRTCSink>()
+                .imp();
+        baseclass.set_signaller(signaller)?;
+
+        Ok(this)
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy, glib::Enum)]
 #[repr(u32)]
 #[enum_type(name = "GstWebRTCSinkCongestionControl")]
