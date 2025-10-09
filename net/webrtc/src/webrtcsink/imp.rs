@@ -4825,8 +4825,6 @@ pub(super) mod parallel {
 
     impl PSWebRTCSink {
         fn connect_signaller(&self, signaller: &Signallable) {
-            println!("Connecting to signaller");
-
             let this = &*self.obj();
             let baseclass = this
                 .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
@@ -4873,25 +4871,21 @@ pub(super) mod parallel {
                         this,
                         move |_signaler: glib::Object, session_id: &str, peer_id: &str, offer: Option<&gst_webrtc::WebRTCSessionDescription>| {
                             if let Some(remote_offer) = offer {
-                                println!("Requesting session {session_id} peer {peer_id} from offer");
                                 if remote_offer.type_() != gst_webrtc::WebRTCSDPType::Offer {
                                     gst::warning!(CAT, obj = this, "Invalid SDP type when requesting session");
                                     return;
                                 }
 
-                                // gst::info!(CAT, obj = this, "Creating session {session_id} to remote {peer_id} with offer {remote_offer:?}");
-                                println!("Creating session {session_id} to remote {peer_id} with offer {remote_offer:?}");
+                                gst::info!(CAT, obj = this, "Creating session {session_id} to remote {peer_id} with offer {remote_offer:?}");
                                 if let Err(err) = this.imp().start_headless_session(session_id, peer_id) {
                                     gst::warning!(CAT, obj = this, "Unable to create offer-based session {session_id}/{peer_id}: {err}");
                                     return;
                                 };
 
-                                println!("Handling offer in session");
                                 let Ok((promise, webrtcbin)) = this.imp().handle_sdp_offer(session_id, remote_offer) else {
                                     gst::warning!(CAT, obj = this, "Unable to handle remote SDP offer");
                                     return;
                                 };
-                                println!("Creating answer through webrtcbin");
                                 webrtcbin.emit_by_name::<()>(
                                     "create-answer",
                                     &[&None::<gst::Structure>, &promise],
