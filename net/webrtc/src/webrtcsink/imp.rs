@@ -4874,7 +4874,7 @@ pub(super) mod parallel {
                         move |_signaler: glib::Object, session_id: &str, peer_id: &str, offer: Option<&gst_webrtc::WebRTCSessionDescription>| {
                             if let Some(remote_offer) = offer {
                                 println!("Requesting session {session_id} peer {peer_id} from offer");
-                                if remote_offer.type_() != gst_webrtc::WebRTCSDPType::Answer {
+                                if remote_offer.type_() != gst_webrtc::WebRTCSDPType::Offer {
                                     gst::warning!(CAT, obj = this, "Invalid SDP type when requesting session");
                                     return;
                                 }
