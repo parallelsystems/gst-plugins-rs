@@ -4824,7 +4824,7 @@ pub(super) mod parallel {
 
     impl PSWebRTCSink {
         fn connect_signaller(&self, signaller: &Signallable) {
-            println!("*** TESTING ***");
+            gst::warning!(CAT, obj = self.obj(), "Connecting to signaller");
 
             let this = &*self.obj();
             let baseclass = this
@@ -5348,6 +5348,7 @@ pub(super) mod parallel {
     impl ObjectImpl for PSWebRTCSink {
         fn constructed(&self) {
             let obj = self.obj();
+            gst::warning!(CAT, obj = obj, "constructing...");
             obj.set_suppressed_flags(gst::ElementFlags::SINK | gst::ElementFlags::SOURCE);
             obj.set_element_flags(gst::ElementFlags::SINK);
 
