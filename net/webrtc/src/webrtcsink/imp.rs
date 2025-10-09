@@ -3250,7 +3250,7 @@ impl BaseWebRTCSink {
     }
 
     fn handle_sdp_answer(&self, session_id: &str, desc: &gst_webrtc::WebRTCSessionDescription) {
-        gst::warning!(CAT, imp = self, "Handling SDP answer for session {session_id}");
+        gst::info!(CAT, imp = self, "Handling SDP answer for session {session_id}");
         let mut state = self.state.lock().unwrap();
 
         if let Some(session) = state.sessions.get(session_id).map(|s| s.0.clone()) {
@@ -5253,8 +5253,6 @@ pub(super) mod parallel {
 
             // Return a promise to the call site since we cannot hold the lock here
             let promise = gst::Promise::with_change_func(glib::clone!(
-                // #[weak(rename_to = this)]
-                // self,
                 #[weak]
                 obj,
                 #[strong(rename_to = session_id)]
@@ -5362,7 +5360,6 @@ pub(super) mod parallel {
     impl ObjectImpl for PSWebRTCSink {
         fn constructed(&self) {
             let obj = self.obj();
-            gst::warning!(CAT, obj = obj, "constructing...");
             obj.set_suppressed_flags(gst::ElementFlags::SINK | gst::ElementFlags::SOURCE);
             obj.set_element_flags(gst::ElementFlags::SINK);
 
