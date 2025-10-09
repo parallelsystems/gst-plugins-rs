@@ -4988,6 +4988,21 @@ pub(super) mod parallel {
             });
         }
 
+        /// When using a custom signaller
+        pub fn set_signaller(&self, signaller: Signallable) -> Result<(), Error> {
+            let sigobj = signaller.clone();
+
+            let obj = self.obj();
+            let baseclass = obj
+                .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
+                .imp();
+            let mut settings = baseclass.settings.lock().unwrap();
+
+            self.connect_signaller(&sigobj);
+            settings.signaller = signaller;
+
+            Ok(())
+        }
 
         /// Called by the signaller to add a new session without the bells and whistles for video-related discovery.
         /// Sets the webrtcbin to `PLAYING` after instantiation and storing in session state.

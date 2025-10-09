@@ -120,10 +120,8 @@ impl ParallelWebRTCSink {
     pub fn with_signaller(signaller: Signallable) -> anyhow::Result<Self> {
         let this: ParallelWebRTCSink = glib::Object::new();
 
-        let baseclass = this
-                .upcast_ref::<BaseWebRTCSink>()
-                .imp();
-        baseclass.set_signaller(signaller)?;
+        let imp = this.imp();
+        imp.set_signaller(signaller)?;
 
         Ok(this)
     }
