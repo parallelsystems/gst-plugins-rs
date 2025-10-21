@@ -117,6 +117,7 @@ impl BaseWebRTCSink {
 }
 
 impl ParallelWebRTCSink {
+    /// Constructor for our `ParallelWebRTCSink` given a signaller.
     pub fn with_signaller(signaller: Signallable) -> anyhow::Result<Self> {
         let this: ParallelWebRTCSink = glib::Object::new();
 

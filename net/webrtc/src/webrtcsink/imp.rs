@@ -4824,6 +4824,25 @@ pub(super) mod parallel {
     pub struct PSWebRTCSink {}
 
     impl PSWebRTCSink {
+        /// Called by parent module constructor; stores a reference to the `signaller` used by this
+        /// instance, and connects to its glib signals.
+        pub fn set_signaller(&self, signaller: Signallable) -> Result<(), Error> {
+            let obj = self.obj();
+            let baseclass = obj
+                .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
+                .imp();
+
+            let sigobj = signaller.clone();
+            self.connect_signaller(&sigobj);
+
+            let mut settings = baseclass.settings.lock().unwrap();
+            settings.signaller = signaller;
+
+            Ok(())
+        }
+
+        /// Connects the `signaller`'s glib signals to closures in this plugin's scope.
+        /// This is the primary interface between the WebRTC plugin and signalling interface.
         fn connect_signaller(&self, signaller: &Signallable) {
             let this = &*self.obj();
             let baseclass = this
@@ -4863,6 +4882,9 @@ pub(super) mod parallel {
                     ),
                 ),
 
+                /// This is the main divergence between this and the `BaseWebRTCSink`.
+                /// Depending on if there is a remote offer or not, we want to create a different kind of session in the underlying
+                /// `webrtcbin`.
                 session_requested: signaller.connect_closure(
                     "session-requested",
                     false,
@@ -4870,6 +4892,7 @@ pub(super) mod parallel {
                         #[watch]
                         this,
                         move |_signaler: glib::Object, session_id: &str, peer_id: &str, offer: Option<&gst_webrtc::WebRTCSessionDescription>| {
+                            // If there is an offer, we don't need to run local discovery, and should just create the session
                             if let Some(remote_offer) = offer {
                                 if remote_offer.type_() != gst_webrtc::WebRTCSDPType::Offer {
                                     gst::warning!(CAT, obj = this, "Invalid SDP type when requesting session");
@@ -4891,6 +4914,8 @@ pub(super) mod parallel {
                                     &[&None::<gst::Structure>, &promise],
                                 );
                             } else {
+                                // If there is no offer, then run local codec discovery to come up with our own local offer first.
+                                // This is effectively the same as the `BaseWebRTCSink` functionality, so we invoke it via the base class.
                                 gst::info!(CAT, obj = this, "Creating session {session_id} to remote {peer_id} from local codec discovery");
                                 let baseclass = this
                                     .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
@@ -4982,24 +5007,8 @@ pub(super) mod parallel {
             });
         }
 
-        /// When using a custom signaller
-        pub fn set_signaller(&self, signaller: Signallable) -> Result<(), Error> {
-            let sigobj = signaller.clone();
-
-            let obj = self.obj();
-            let baseclass = obj
-                .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
-                .imp();
-            let mut settings = baseclass.settings.lock().unwrap();
-
-            self.connect_signaller(&sigobj);
-            settings.signaller = signaller;
-
-            Ok(())
-        }
-
-        /// Called by the signaller to add a new session without the bells and whistles for video-related discovery.
-        /// Sets the webrtcbin to `PLAYING` after instantiation and storing in session state.
+        /// Called by the signaller to add a new session without running codec discovery.
+        /// Sets the `webrtcbin` to `PLAYING` after instantiation and storing in session state.
         fn start_headless_session(
             &self,
             session_id: &str,
@@ -5021,9 +5030,6 @@ pub(super) mod parallel {
             let pipeline = gst::Pipeline::builder()
                 .name(format!("session-pipeline-{session_id}"))
                 .build();
-
-            // Does the baseclass need to emit this or are signals inherited?
-            gst::warning!(CAT, obj = obj, "Emitting consumer-pipeline-created");
 
             self.obj()
                 .emit_by_name::<()>("consumer-pipeline-created", &[&peer_id, &pipeline]);
@@ -5225,9 +5231,7 @@ pub(super) mod parallel {
             Ok(())
         }
 
-        /// Meant to set the remote SDP Offer for a TextRoom connection.
-        /// This is called from the `session-description` closure after `session-requested`.
-        ///
+        /// Handles the remote SDP Offer presented to the plugin (for a TextRoom connection).
         /// Returns a promise for use with `create-answer` at the call site.
         fn handle_sdp_offer(&self, session_id: &str, offer: &gst_webrtc::WebRTCSessionDescription) -> Result<(gst::Promise, gst::Bin), WebRTCSinkError>{
             let obj = self.obj();
@@ -5366,10 +5370,9 @@ pub(super) mod parallel {
             let baseclass = obj
                 .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
                 .imp();
-
             baseclass.parent_constructed();
-            let signaller = baseclass.settings.lock().unwrap().signaller.clone();
 
+            let signaller = baseclass.settings.lock().unwrap().signaller.clone();
             self.connect_signaller(&signaller);
         }
     }
@@ -5382,7 +5385,7 @@ pub(super) mod parallel {
                 gst::subclass::ElementMetadata::new(
                     "ParallelWebRTCSink",
                     "Sink/Network/WebRTC",
-                    "WebRTC sink for Parallel Systems media service",
+                    "WebRTC sink for Parallel Systems media service (TextRoom + VideoRoom)",
                     "Vladi Iotov <viotov@moveparallel.com>",
                 )
             });
