@@ -5064,6 +5064,7 @@ pub(super) mod parallel {
                 }
             }
 
+            // Critically, this pipeline only contains the `webrtcbin`. It doesn't do anything video-related.
             pipeline.add(&webrtcbin).unwrap();
 
             webrtcbin.connect_closure(
