@@ -3038,6 +3038,11 @@ impl BaseWebRTCSink {
             let mut session_guard = session.0.lock().unwrap();
             let session = session_guard.deref_mut();
             if let Some(congestion_controller) = session.congestion_controller.as_mut() {
+                gst::warning!(
+                    CAT,
+                    obj = self.obj(),
+                    "Processing loss stats for session {session_id:?}: {stats:?}"
+                );
                 congestion_controller.loss_control(&self.obj(), stats, &mut session.encoders);
             }
             stats.clone_into(&mut session.stats);
@@ -3060,6 +3065,11 @@ impl BaseWebRTCSink {
                         let session = session_guard.deref_mut();
                         if let Some(congestion_controller) = session.congestion_controller.as_mut()
                         {
+                            gst::warning!(
+                                CAT,
+                                obj = this.obj(),
+                                "Processing delay stats for session {session_id:?}: {stats:?}"
+                            );
                             congestion_controller.delay_control(
                                 &this.obj(),
                                 stats,
@@ -3362,13 +3372,13 @@ impl BaseWebRTCSink {
             src.clone().upcast::<gst::Element>()
         };
 
-        gst::debug!(
+        gst::warning!(
             CAT,
             imp = self,
             "Running discovery pipeline for input caps {input_caps} and output caps {output_caps} with codec {codec:?}"
         );
 
-        gst::debug!(CAT, imp = self, "Running discovery pipeline");
+        gst::warning!(CAT, imp = self, "Running discovery pipeline");
         let elements_slice = &elements.iter().collect::<Vec<_>>();
         pipe.0.add_many(elements_slice).unwrap();
         gst::Element::link_many(elements_slice)
@@ -3525,7 +3535,7 @@ impl BaseWebRTCSink {
         let futs = if let Some(codec) = codecs.find_for_encoded_caps(&discovery_info.caps) {
             let mut caps = discovery_info.caps.clone();
 
-            gst::info!(
+            gst::warning!(
                 CAT,
                 imp = self,
                 "Stream is already encoded with codec {}, still need to payload it",
