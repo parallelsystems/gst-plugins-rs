@@ -4285,6 +4285,18 @@ impl ObjectImpl for BaseWebRTCSink {
                     ])
                     .return_type::<gst::Element>()
                     .build(),
+                /**
+                 * GstBaseWebRTCSink::cc-bitrate-changed:
+                 * @delay-controller bitrate target
+                 * @loss-controller bitrate target
+                 * @overall bitrate target
+                 *
+                 * This signal is emit by the homegrown `CongestionController` when
+                 * it updates its target bitrate. All bitrates are in bps.
+                 */
+                glib::subclass::Signal::builder("cc-bitrate-changed")
+                    .param_types([u32::static_type(), u32::static_type(), u32::static_type()])
+                    .build(),
             ]
         });
 
