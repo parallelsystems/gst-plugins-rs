@@ -3163,6 +3163,13 @@ impl BaseWebRTCSink {
                         .set_property("fec-percentage", (fec_percentage as u32).min(100));
                 }
             }
+
+            gst::info!(
+                CAT,
+                obj = self.obj(),
+                "Finished setting bitrate {}",
+                bitrate,
+            );
         } else {
             gst::warning!(
                 CAT,
