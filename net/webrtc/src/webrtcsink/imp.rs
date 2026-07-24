@@ -3162,10 +3162,16 @@ impl BaseWebRTCSink {
                     obj = self.obj(),
                     "Setting bitrate on encoder {} => {}, FEC {}",
                     encoder.factory_name,
-                    bitrate,
+                    encoders_bitrate,
                     fec_percentage,
                 );
                 if encoder.set_bitrate(&self.obj(), encoders_bitrate).is_ok() {
+                    gst::info!(
+                        CAT,
+                        obj = self.obj(),
+                        "Setting FEC on transceiver {}",
+                        fec_percentage,
+                    );
                     encoder
                         .transceiver
                         .set_property("fec-percentage", (fec_percentage as u32).min(100));
