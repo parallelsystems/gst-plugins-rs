@@ -950,9 +950,10 @@ impl VideoEncoder {
         gst::info!(
             CAT,
             obj = element,
-            "VideoEncoder setting bitrate {} on {}",
+            "VideoEncoder setting bitrate {} on {} (dyn {})",
             bitrate,
-            self.factory_name.as_str()
+            self.factory_name.as_str(),
+            element.property::<bool>("do-dynamic-decimation")
         );
 
         if element.property("do-dynamic-decimation") {
@@ -999,7 +1000,7 @@ impl VideoEncoder {
                 .build();
 
             if !caps.is_strictly_equal(&current_caps) {
-                gst::log!(
+                gst::info!(
                     CAT,
                     obj = element,
                     "session {}: setting bitrate {} and caps {} on encoder {:?}",
