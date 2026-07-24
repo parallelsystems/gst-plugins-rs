@@ -2505,6 +2505,11 @@ impl BaseWebRTCSink {
                         None
                     }
                     Ok(cc) => {
+                        gst::info!(
+                            CAT,
+                            obj = element,
+                            "Connecting to webrtcbin request-aux-sender signal",
+                        );
                         webrtcbin.connect_closure(
                             "request-aux-sender",
                             false,
@@ -2515,7 +2520,7 @@ impl BaseWebRTCSink {
                                 session_id,
                                 #[strong]
                                 cc,
-                                move |_webrtcbin: gst::Element, _transport: gst::Object| {
+                                move |webrtcbin: gst::Element, _transport: gst::Object| {
                                     let settings = element.imp().settings.lock().unwrap();
 
                                     // TODO: Bind properties with @element's
@@ -2525,6 +2530,12 @@ impl BaseWebRTCSink {
                                         ("max-bitrate", &settings.cc_info.max_bitrate),
                                     ]);
 
+                                    gst::info!(
+                                        CAT,
+                                        obj = webrtcbin,
+                                        "Connecting to GCC estimated bitrate",
+                                    );
+
                                     cc.connect_notify(
                                         Some("estimated-bitrate"),
                                         glib::clone!(
@@ -2533,9 +2544,17 @@ impl BaseWebRTCSink {
                                             #[strong]
                                             session_id,
                                             move |bwe, pspec| {
+                                                let br = bwe.property::<u32>(pspec.name());
+                                                gst::info!(
+                                                    CAT,
+                                                    obj = element,
+                                                    "Got estimated bitrate from GCC {}",
+                                                    br
+                                                );
+
                                                 element.imp().set_bitrate(
                                                     &session_id,
-                                                    bwe.property::<u32>(pspec.name()),
+                                                    br,
                                                 );
                                             }
                                         ),
