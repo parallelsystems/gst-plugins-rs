@@ -3115,6 +3115,13 @@ impl BaseWebRTCSink {
 
     #[cfg(feature = "v1_22")]
     fn set_bitrate(&self, session_id: &str, bitrate: u32) {
+        gst::info!(
+            CAT,
+            obj = self.obj(),
+            "Setting bitrate {} => {}",
+            session_id,
+            bitrate
+        );
         let settings = self.settings.lock().unwrap();
         let mut state = self.state.lock().unwrap();
 
@@ -3142,12 +3149,27 @@ impl BaseWebRTCSink {
             }
 
             for encoder in session.encoders.iter_mut() {
+                gst::info!(
+                    CAT,
+                    obj = self.obj(),
+                    "Setting bitrate on encoder {} => {}, FEC {}",
+                    encoder.factory_name,
+                    bitrate,
+                    fec_percentage,
+                );
                 if encoder.set_bitrate(&self.obj(), encoders_bitrate).is_ok() {
                     encoder
                         .transceiver
                         .set_property("fec-percentage", (fec_percentage as u32).min(100));
                 }
             }
+        } else {
+            gst::warning!(
+                CAT,
+                obj = self.obj(),
+                "Unable to set bitrate for {}, didn't exist",
+                session_id
+            );
         }
     }
 
