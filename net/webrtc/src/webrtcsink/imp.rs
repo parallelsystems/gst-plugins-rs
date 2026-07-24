@@ -947,6 +947,14 @@ impl VideoEncoder {
             _ => return Err(WebRTCSinkError::BitrateNotSupported),
         }
 
+        gst::info!(
+            CAT,
+            obj = element,
+            "VideoEncoder setting bitrate {} on {}",
+            bitrate,
+            self.factory_name.as_str()
+        );
+
         if element.property("do-dynamic-decimation") {
             let current_caps = self.filter.property::<gst::Caps>("caps");
             let mut s = current_caps.structure(0).unwrap().to_owned();
