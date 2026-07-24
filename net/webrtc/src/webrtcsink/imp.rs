@@ -953,66 +953,67 @@ impl VideoEncoder {
             "VideoEncoder setting bitrate {} on {} (dyn {})",
             bitrate,
             self.factory_name.as_str(),
-            element.property::<bool>("do-dynamic-decimation")
+            true
+            // element.property::<bool>("do-dynamic-decimation")
         );
 
-        if element.property("do-dynamic-decimation") {
-            let current_caps = self.filter.property::<gst::Caps>("caps");
-            let mut s = current_caps.structure(0).unwrap().to_owned();
+        // if element.property("do-dynamic-decimation") {
+        //     let current_caps = self.filter.property::<gst::Caps>("caps");
+        //     let mut s = current_caps.structure(0).unwrap().to_owned();
 
-            // Hardcoded thresholds have been adapted from the values that shipped
-            // with the plugin to suit our needs.
-            //
-            // In the lowest quality mode, we still maintain 720p, but rely on downstream
-            // encoder's quantization to fit the bitrate budget.
-            if bitrate < 1_000_000 {
-                let height = 720i32.min(self.video_info.height() as i32);
-                let width = self.scale_height_round_2(height);
+        //     // Hardcoded thresholds have been adapted from the values that shipped
+        //     // with the plugin to suit our needs.
+        //     //
+        //     // In the lowest quality mode, we still maintain 720p, but rely on downstream
+        //     // encoder's quantization to fit the bitrate budget.
+        //     if bitrate < 1_000_000 {
+        //         let height = 720i32.min(self.video_info.height() as i32);
+        //         let width = self.scale_height_round_2(height);
 
-                if self.halved_framerate.numer() != 0 {
-                    s.set("framerate", self.halved_framerate);
-                }
+        //         if self.halved_framerate.numer() != 0 {
+        //             s.set("framerate", self.halved_framerate);
+        //         }
 
-                s.set("height", height);
-                s.set("width", width);
+        //         s.set("height", height);
+        //         s.set("width", width);
 
-                self.mitigation_mode =
-                    WebRTCSinkMitigationMode::DOWNSAMPLED | WebRTCSinkMitigationMode::DOWNSCALED;
-            } else if bitrate < 2_500_000 {
-                let height = 720i32.min(self.video_info.height() as i32);
-                let width = self.scale_height_round_2(height);
+        //         self.mitigation_mode =
+        //             WebRTCSinkMitigationMode::DOWNSAMPLED | WebRTCSinkMitigationMode::DOWNSCALED;
+        //     } else if bitrate < 2_500_000 {
+        //         let height = 720i32.min(self.video_info.height() as i32);
+        //         let width = self.scale_height_round_2(height);
 
-                s.set("height", height);
-                s.set("width", width);
-                s.remove_field("framerate");
+        //         s.set("height", height);
+        //         s.set("width", width);
+        //         s.remove_field("framerate");
 
-                self.mitigation_mode = WebRTCSinkMitigationMode::DOWNSCALED;
-            } else {
-                s.remove_field("height");
-                s.remove_field("width");
-                s.remove_field("framerate");
+        //         self.mitigation_mode = WebRTCSinkMitigationMode::DOWNSCALED;
+        //     } else {
+        //         s.remove_field("height");
+        //         s.remove_field("width");
+        //         s.remove_field("framerate");
 
-                self.mitigation_mode = WebRTCSinkMitigationMode::NONE;
-            }
+        //         self.mitigation_mode = WebRTCSinkMitigationMode::NONE;
+        //     }
 
-            let caps = gst::Caps::builder_full_with_any_features()
-                .structure(s)
-                .build();
+        //     let caps = gst::Caps::builder_full_with_any_features()
+        //         .structure(s)
+        //         .build();
 
-            if !caps.is_strictly_equal(&current_caps) {
-                gst::info!(
-                    CAT,
-                    obj = element,
-                    "session {}: setting bitrate {} and caps {} on encoder {:?}",
-                    self.session_id,
-                    bitrate,
-                    caps,
-                    self.element
-                );
+        //     if !caps.is_strictly_equal(&current_caps) {
+        //         gst::info!(
+        //             CAT,
+        //             obj = element,
+        //             "session {}: setting bitrate {} and caps {} on encoder {:?}",
+        //             self.session_id,
+        //             bitrate,
+        //             caps,
+        //             self.element
+        //         );
 
-                self.filter.set_property("caps", caps);
-            }
-        }
+        //         self.filter.set_property("caps", caps);
+        //     }
+        // }
 
         Ok(())
     }
