@@ -1371,11 +1371,11 @@ impl ObjectImpl for BandwidthEstimator {
                 state.estimator.to_value()
             }
             "loss-controller-bitrate" => {
-                let mut state = self.state.lock().unwrap();
+                let state = self.state.lock().unwrap();
                 state.target_bitrate_on_loss.to_value()
             }
             "delay-controller-bitrate" => {
-                let mut state = self.state.lock().unwrap();
+                let state = self.state.lock().unwrap();
                 state.target_bitrate_on_delay.to_value()
             }
             _ => unimplemented!(),

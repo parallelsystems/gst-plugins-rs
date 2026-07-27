@@ -2,7 +2,7 @@
 resolver = "2"
 
 members = [
-    # "net/rtp",
+    "net/rtp",
     # "net/rtsp",
     # "net/webrtchttp",
     "net/webrtc",
@@ -12,7 +12,7 @@ members = [
 
 # Only plugins without external dependencies
 default-members = [
-    # "net/rtp",
+    "net/rtp",
     # "net/rtsp",
     # "net/webrtchttp",
     "net/webrtc",

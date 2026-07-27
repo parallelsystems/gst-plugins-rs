@@ -21,7 +21,7 @@ gst-net   = { workspace = true, features = ["v1_20"] }
 gst-rtp   = { workspace = true, features = ["v1_20"] }
 gst-video = { workspace = true, features = ["v1_20"] }
 futures = "0.3"
-gio.workspace = true
+gio = "0.20"
 hex = "0.4.3"
 log = "0.4"
 once_cell.workspace = true
