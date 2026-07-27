@@ -33,6 +33,11 @@ use time::Duration;
 type Bitrate = u32;
 type BufferList = SmallVec<[gst::Buffer; 10]>;
 
+// Assumed framerate
+const EXPECTED_FRAMERATE: f64 = 20.;
+// Bucket size is based on framerate
+const BUCKET_SIZE_DURATION_MSEC: f64 = 1000. / EXPECTED_FRAMERATE;
+
 const DEFAULT_MIN_BITRATE: Bitrate = 1000;
 const DEFAULT_ESTIMATED_BITRATE: Bitrate = 2_048_000;
 const DEFAULT_MAX_BITRATE: Bitrate = 8_192_000;
@@ -455,6 +460,7 @@ impl Detector {
 
     fn update(&mut self, packets: &mut Vec<Packet>) {
         self.update_rtts(packets);
+
         let mut lost_packets = 0.;
         let n_packets = packets.len();
         for pkt in packets {
@@ -499,6 +505,11 @@ impl Detector {
 
             if pkt.arrival < self.group.arrival.unwrap() {
                 // ignore out of order arrivals
+                gst::trace!(
+                    CAT,
+                    "Packet {} arrived out of order - ignoring",
+                    pkt.seqnum
+                );
                 continue;
             }
 
@@ -516,6 +527,11 @@ impl Detector {
                 if self.group.inter_arrival_time_pkt(pkt) < BURST_TIME
                     && self.group.inter_delay_variation_pkt(pkt) < Duration::ZERO
                 {
+                    gst::trace!(
+                        CAT,
+                        "Packet {} arrived late, but in a burst, so we're tracking it",
+                        pkt.seqnum
+                    );
                     self.group.add(*pkt);
                     continue;
                 }
@@ -779,8 +795,8 @@ impl State {
         let mut list_size = 0;
         let mut list = BufferList::new();
 
-        // Leak the bucket so it can hold at most 30ms of data
-        let maximum_remaining_bits = 30. * self.estimated_bitrate as f64 / 1000.;
+        // Leak the bucket so it can hold at most 50ms of data
+        let maximum_remaining_bits = BUCKET_SIZE_DURATION_MSEC * self.estimated_bitrate as f64 / 1000.;
         let mut leaked = false;
         while (budget > 0 || remaining > maximum_remaining_bits) && !self.buffers.is_empty() {
             let buf = self.buffers.pop_back().unwrap();
@@ -839,7 +855,7 @@ impl State {
 
         self.last_increase_on_delay = Some(now);
         if self.ema.estimate_is_close(effective_bitrate) {
-            let bits_per_frame = target_bitrate / 30.;
+            let bits_per_frame = target_bitrate / EXPECTED_FRAMERATE;
             let packets_per_frame = f64::ceil(bits_per_frame / (1200. * 8.));
             let avg_packet_size_bits = bits_per_frame / packets_per_frame;
 
