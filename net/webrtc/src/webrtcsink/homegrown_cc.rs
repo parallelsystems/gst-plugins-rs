@@ -93,10 +93,11 @@ pub struct CongestionController {
     min_bitrate: u32,
     max_bitrate: u32,
     do_fec: bool,
+    do_apply: bool,
 }
 
 impl CongestionController {
-    pub fn new(peer_id: &str, min_bitrate: u32, max_bitrate: u32, do_fec: bool) -> Self {
+    pub fn new(peer_id: &str, min_bitrate: u32, max_bitrate: u32, do_fec: bool, do_apply: bool) -> Self {
         Self {
             target_bitrate_on_delay: 0,
             target_bitrate_on_loss: 0,
@@ -107,6 +108,7 @@ impl CongestionController {
             min_bitrate,
             max_bitrate,
             do_fec,
+            do_apply
         }
     }
 
@@ -403,25 +405,27 @@ impl CongestionController {
                 human_bytes::human_bytes(self.max_bitrate),
             );
 
-            let fec_ratio = {
-                if self.do_fec {
-                    if target_bitrate <= 2000000 || self.max_bitrate <= 2000000 {
-                        0f64
+            if self.do_apply {
+                let fec_ratio = {
+                    if self.do_fec {
+                        if target_bitrate <= 2000000 || self.max_bitrate <= 2000000 {
+                            0f64
+                        } else {
+                            (target_bitrate as f64 - 2000000f64) / (self.max_bitrate as f64 - 2000000f64)
+                        }
                     } else {
-                        (target_bitrate as f64 - 2000000f64) / (self.max_bitrate as f64 - 2000000f64)
+                        0.0
                     }
-                } else {
-                    0.0
-                }
-            };
+                };
 
-            let fec_percentage = (fec_ratio * 50f64) as u32;
+                let fec_percentage = (fec_ratio * 50f64) as u32;
 
-            for encoder in encoders.iter_mut() {
-                if encoder.set_bitrate(element, target_bitrate).is_ok() {
-                    encoder
-                        .transceiver
-                        .set_property("fec-percentage", fec_percentage);
+                for encoder in encoders.iter_mut() {
+                    if encoder.set_bitrate(element, target_bitrate).is_ok() {
+                        encoder
+                            .transceiver
+                            .set_property("fec-percentage", fec_percentage);
+                    }
                 }
             }
 

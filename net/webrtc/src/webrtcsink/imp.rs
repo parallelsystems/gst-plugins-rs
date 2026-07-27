@@ -2757,15 +2757,13 @@ impl BaseWebRTCSink {
             pipeline.clone(),
             webrtcbin.clone(),
             peer_id.clone(),
-            match settings.cc_info.heuristic {
-                WebRTCSinkCongestionControl::Homegrown => Some(CongestionController::new(
-                    &peer_id,
-                    settings.cc_info.min_bitrate,
-                    settings.cc_info.max_bitrate,
-                    settings.do_fec,
-                )),
-                _ => None,
-            },
+            Some(CongestionController::new(
+                &peer_id,
+                settings.cc_info.min_bitrate,
+                settings.cc_info.max_bitrate,
+                settings.do_fec,
+                settings.cc_info.heuristic == WebRTCSinkCongestionControl::Homegrown
+            )),
             rtpgccbwe,
             settings.cc_info,
         );
