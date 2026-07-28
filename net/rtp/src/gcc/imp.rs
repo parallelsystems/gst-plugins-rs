@@ -40,7 +40,7 @@ const BUCKET_SIZE_DURATION_MSEC: f64 = 1000. / EXPECTED_FRAMERATE;
 // 5.5.  Rate control - The response_time interval
 //    is estimated as the round-trip time plus 100 ms as an estimate of
 //    over-use estimator and detector reaction time.
-const ADDITIVE_INCREASE_ADD_ON_MSEC: f64 = 100;
+const ADDITIVE_INCREASE_ADD_ON_MSEC: f64 = 100.;
 
 const DEFAULT_MIN_BITRATE: Bitrate = 1000;
 const DEFAULT_ESTIMATED_BITRATE: Bitrate = 2_048_000;
