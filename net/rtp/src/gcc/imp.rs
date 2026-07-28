@@ -1245,7 +1245,16 @@ impl ObjectSubclass for BandwidthEstimator {
                         let bwe = this.obj();
 
                         if let Some(structure) = event.structure() {
+
                             if structure.name() == "RTPTWCCPackets" {
+                                gst::debug!(
+                                    CAT,
+                                    obj = bwe,
+                                    "RTPTWCCPackets {:?}",
+                                    structure.to_string()
+                                );
+
+
                                 let varray = structure.get::<glib::ValueArray>("packets").unwrap();
                                 let mut packets = varray
                                     .iter()
