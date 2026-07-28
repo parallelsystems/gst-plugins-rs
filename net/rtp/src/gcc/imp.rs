@@ -1247,18 +1247,18 @@ impl ObjectSubclass for BandwidthEstimator {
                         if let Some(structure) = event.structure() {
                             if structure.name() == "RTPTWCCPackets" {
                                 let varray = structure.get::<glib::ValueArray>("packets").unwrap();
-                                gst::trace!(
-                                    CAT,
-                                    obj = bwe,
-                                    "TWCC Packets {:?}",
-                                    varray
-                                );
                                 let mut packets = varray
                                     .iter()
                                     .filter_map(|s| {
                                         Packet::from_structure(&s.get::<gst::Structure>().unwrap())
                                     })
                                     .collect::<Vec<Packet>>();
+                                gst::debug!(
+                                    CAT,
+                                    obj = bwe,
+                                    "TWCC Packets {:?}",
+                                    packets
+                                );
 
                                 // The list of packets could be empty once parsed
                                 if !packets.is_empty() {
