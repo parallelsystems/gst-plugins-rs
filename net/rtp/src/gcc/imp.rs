@@ -86,7 +86,8 @@ const PACKETS_RECEIVED_WINDOW: Duration = Duration::milliseconds(1000); // ms
 // ```
 // |m(i)| - del_var_th(i) > 15
 // ```
-const MAX_M_MINUS_DEL_VAR_TH: Duration = Duration::milliseconds(15);
+// Was 15 msec
+const MAX_M_MINUS_DEL_VAR_TH: Duration = Duration::milliseconds(30);
 
 // from 5.4 "It is also RECOMMENDED to clamp del_var_th(i) to the range [6, 600]"
 const MIN_THRESHOLD: Duration = Duration::milliseconds(6);
