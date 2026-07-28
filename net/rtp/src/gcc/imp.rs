@@ -55,14 +55,15 @@ static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
 });
 
 // Table1. Time limit in milliseconds  between packet bursts which  identifies a group
-// was 5msec
-const BURST_TIME: Duration = Duration::milliseconds(10);
+const BURST_TIME_MSEC_DEFAULT: u32 = 5;
+// const BURST_TIME: Duration = Duration::milliseconds(BURST_TIME_MSEC_DEFAULT as i64);
 
 // Table1. Initial value for the adaptive threshold
 const INITIAL_DEL_VAR_TH: Duration = Duration::microseconds(12500);
 
-// Table1. Time required to trigger an overuse signal -- was 10msec
-const OVERUSE_TIME_TH: Duration = Duration::milliseconds(100);
+// Table1. Time required to trigger an overuse signal
+const OVERUSE_TIME_TRIGGER_MSEC_DEFAULT: u32 = 10;
+// const OVERUSE_TIME_TH: Duration = Duration::milliseconds(OVERUSE_TIME_TRIGGER_MSEC_DEFAULT as i64);
 
 // from 5.5 "beta is typically chosen to be in the interval [0.8, 0.95], 0.85 is the RECOMMENDED value."
 const BETA: f64 = 0.85;
@@ -86,8 +87,8 @@ const PACKETS_RECEIVED_WINDOW: Duration = Duration::milliseconds(1000); // ms
 // ```
 // |m(i)| - del_var_th(i) > 15
 // ```
-// Was 15 msec
-const MAX_M_MINUS_DEL_VAR_TH: Duration = Duration::milliseconds(30);
+const MAX_M_MINUS_DEL_VAR_MSEC_DEFAULT: u32 = 15;
+// const MAX_M_MINUS_DEL_VAR_TH: Duration = Duration::milliseconds(MAX_M_MINUS_DEL_VAR_MSEC_DEFAULT as i64);
 
 // from 5.4 "It is also RECOMMENDED to clamp del_var_th(i) to the range [6, 600]"
 const MIN_THRESHOLD: Duration = Duration::milliseconds(6);
@@ -103,7 +104,8 @@ const LOSS_INCREASE_THRESHOLD: f64 = 0.02;
 const LOSS_INCREASE_FACTOR: f64 = 1.05;
 
 // Minimal duration between 2 updates on the lost based rate controller
-const DELAY_UPDATE_INTERVAL: Duration = Duration::milliseconds(100);
+const DELAY_UPDATE_INTERVAL_MSEC_DEFAULT: u32 = 100;
+// const DELAY_UPDATE_INTERVAL: Duration = Duration::milliseconds(DELAY_UPDATE_INTERVAL_MSEC_DEFAULT as i64);
 
 const ROUND_TRIP_TIME_WINDOW_SIZE: usize = 100;
 
@@ -464,11 +466,14 @@ impl Detector {
         )
     }
 
-    fn update(&mut self, packets: &mut Vec<Packet>) {
+    fn update(&mut self, packets: &mut Vec<Packet>, burst_time_msec: u32, overuse_trigger_msec: u32, overuse_threshold_msec: u32) {
         self.update_rtts(packets);
 
         let mut lost_packets = 0.;
         let n_packets = packets.len();
+        let burst_time = Duration::milliseconds(burst_time_msec as i64);
+        let overuse_trigger = Duration::milliseconds(overuse_trigger_msec as i64);
+        let overuse_threshold = Duration::milliseconds(overuse_threshold_msec as i64);
 
         for pkt in packets {
             // We know feedbacks packets will arrive "soon" after the packets they are reported for or considered
@@ -521,7 +526,7 @@ impl Detector {
             }
 
             if pkt.departure >= self.group.departure {
-                if self.group.inter_departure_time_pkt(pkt) < BURST_TIME {
+                if self.group.inter_departure_time_pkt(pkt) < burst_time {
                     self.group.add(*pkt);
                     continue;
                 }
@@ -531,7 +536,7 @@ impl Detector {
                 // A Packet which has an inter-arrival time less than burst_time and
                 // an inter-group delay variation d(i) less than 0 is considered
                 // being part of the current group of packets.
-                if self.group.inter_arrival_time_pkt(pkt) < BURST_TIME
+                if self.group.inter_arrival_time_pkt(pkt) < burst_time
                     && self.group.inter_delay_variation_pkt(pkt) < Duration::ZERO
                 {
                     gst::trace!(
@@ -553,7 +558,7 @@ impl Detector {
                     // 5.3 Arrival-time filter
                     self.estimator_impl.update(&prev_group, &group);
                     // 5.4 Over-use detector
-                    self.overuse_filter();
+                    self.overuse_filter(overuse_trigger, overuse_threshold);
                 }
             } else {
                 gst::debug!(
@@ -582,7 +587,7 @@ impl Detector {
         self.last_loss_update = Some(now);
     }
 
-    fn compare_threshold(&mut self) -> (NetworkUsage, Duration) {
+    fn compare_threshold(&mut self, overuse_threshold: Duration) -> (NetworkUsage, Duration) {
         // FIXME: It is unclear where that factor is coming from but all
         // implementations we found have it (libwebrtc, pion, jitsi...), and the
         // algorithm does not work without it.
@@ -605,12 +610,12 @@ impl Detector {
             NetworkUsage::Normal
         };
 
-        self.update_threshold(&amplified_estimate);
+        self.update_threshold(&amplified_estimate, overuse_threshold);
 
         (usage, amplified_estimate)
     }
 
-    fn update_threshold(&mut self, estimate: &Duration) {
+    fn update_threshold(&mut self, estimate: &Duration, overuse_threshold: Duration) {
         const K_U: f64 = 0.01; // Table1. Coefficient for the adaptive threshold
         const K_D: f64 = 0.00018; // Table1. Coefficient for the adaptive threshold
         const MAX_TIME_DELTA: Duration = Duration::milliseconds(100);
@@ -621,7 +626,7 @@ impl Detector {
         }
 
         let abs_estimate = estimate.abs();
-        if abs_estimate > self.threshold + MAX_M_MINUS_DEL_VAR_TH {
+        if abs_estimate > self.threshold + overuse_threshold {
             self.last_threshold_update = Some(now);
             return;
         }
@@ -642,8 +647,8 @@ impl Detector {
         self.last_threshold_update = Some(now);
     }
 
-    fn overuse_filter(&mut self) {
-        let (th_usage, amplified_estimate) = self.compare_threshold();
+    fn overuse_filter(&mut self, overuse_trigger: Duration, overuse_threshold: Duration) {
+        let (th_usage, amplified_estimate) = self.compare_threshold(overuse_threshold);
 
         let now = Instant::now();
         let delta = now - self.last_use_detector_update;
@@ -653,7 +658,7 @@ impl Detector {
                 self.increasing_duration += delta;
                 self.increasing_counter += 1;
 
-                if self.increasing_duration > OVERUSE_TIME_TH
+                if self.increasing_duration > overuse_trigger
                     && self.increasing_counter > 1
                     && amplified_estimate > self.last_overuse_estimate
                 {
@@ -755,6 +760,12 @@ struct State {
 
     flow_return: Result<gst::FlowSuccess, gst::FlowError>,
     last_push: Instant,
+
+    // Properties
+    burst_time_msec: u32,
+    overuse_trigger_msec: u32,
+    overuse_threshold_msec: u32,
+    delay_controller_interval_msec: u32
 }
 
 impl Default for State {
@@ -779,6 +790,10 @@ impl Default for State {
             clock_entry: None,
             last_push: Instant::now(),
             budget_offset: 0,
+            burst_time_msec: BURST_TIME_MSEC_DEFAULT,
+            overuse_trigger_msec: OVERUSE_TIME_TRIGGER_MSEC_DEFAULT,
+            overuse_threshold_msec: MAX_M_MINUS_DEL_VAR_MSEC_DEFAULT,
+            delay_controller_interval_msec: DELAY_UPDATE_INTERVAL_MSEC_DEFAULT
         }
     }
 }
@@ -842,7 +857,7 @@ impl State {
         let time_since_last_update_ms = match self.last_increase_on_delay {
             None => 0.,
             Some(prev) => {
-                if now - prev < DELAY_UPDATE_INTERVAL {
+                if now - prev < Duration::milliseconds(self.delay_controller_interval_msec as i64) {
                     return None;
                 }
 
@@ -1046,7 +1061,7 @@ impl State {
             },
             NetworkUsage::Over => {
                 let now = Instant::now();
-                if now - self.last_decrease_on_delay > DELAY_UPDATE_INTERVAL {
+                if now - self.last_decrease_on_delay > Duration::milliseconds(self.delay_controller_interval_msec as i64) {
                     let effective_bitrate = self.detector.effective_bitrate();
                     let target =
                         (self.estimated_bitrate as f64 * 0.95).min(BETA * effective_bitrate as f64);
@@ -1102,8 +1117,13 @@ impl BandwidthEstimator {
         let weak_pad = self.srcpad.downgrade();
         let clock = gst::SystemClock::obtain();
 
+        let burst_time = {
+            let state = self.state.lock().unwrap();
+            Duration::milliseconds(state.burst_time_msec as i64)
+        };
+
         bwe.imp().state.lock().unwrap().clock_entry =
-            Some(clock.new_single_shot_id(clock.time().unwrap() + dur2ts(BURST_TIME)));
+            Some(clock.new_single_shot_id(clock.time().unwrap() + dur2ts(burst_time)));
 
         self.srcpad.start_task(move || {
             let pause = || {
@@ -1139,8 +1159,9 @@ impl BandwidthEstimator {
             }
             let list = {
                 let mut state = lock_state();
+                let burst_time = Duration::milliseconds(state.burst_time_msec as i64);
                 clock
-                    .single_shot_id_reinit(&clock_entry, clock.time().unwrap() + dur2ts(BURST_TIME))
+                    .single_shot_id_reinit(&clock_entry, clock.time().unwrap() + dur2ts(burst_time))
                     .unwrap();
                 state.clock_entry = Some(clock_entry);
                 state.create_buffer_list(&bwe)
@@ -1168,7 +1189,9 @@ impl BandwidthEstimator {
     ) -> Result<(), gst::LoggableError> {
         if let gst::PadMode::Push = mode {
             if active {
-                self.state.lock().unwrap().flow_return = Ok(gst::FlowSuccess::Ok);
+                {
+                    self.state.lock().unwrap().flow_return = Ok(gst::FlowSuccess::Ok);
+                }
                 self.start_task(bwe)?;
             } else {
                 let mut state = self.state.lock().unwrap();
@@ -1237,8 +1260,11 @@ impl ObjectSubclass for BandwidthEstimator {
 
                                     let bitrate_changed = {
                                         let mut state = this.state.lock().unwrap();
+                                        let burst_time = state.burst_time_msec;
+                                        let overuse_trigger = state.overuse_trigger_msec;
+                                        let overuse_threshold = state.overuse_threshold_msec;
 
-                                        state.detector.update(&mut packets);
+                                        state.detector.update(&mut packets, burst_time, overuse_trigger, overuse_threshold);
                                         let bitrate_updated_by_delay = state.delay_control(&bwe);
                                         let bitrate_updated_by_loss = state.loss_control(&bwe);
                                         let bitrate_changed = bitrate_updated_by_delay || bitrate_updated_by_loss;
@@ -1359,6 +1385,39 @@ impl ObjectImpl for BandwidthEstimator {
                     .blurb("How to calculate the delay estimate that will be compared against the dynamic delay threshold.")
                     .mutable_ready()
                     .build(),
+                // Allow tweaking some of the const weights
+                glib::ParamSpecUInt::builder("burst-time")
+                    .nick("Packet Burst Time (msec)")
+                    .blurb("Time limit in milliseconds between packet bursts which identifies a group")
+                    .minimum(1)
+                    .maximum(u32::MAX)
+                    .default_value(BURST_TIME_MSEC_DEFAULT)
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecUInt::builder("overuse-trigger")
+                    .nick("Overuse Trigger (msec)")
+                    .blurb("Time required to trigger an overuse signal")
+                    .minimum(1)
+                    .maximum(u32::MAX)
+                    .default_value(OVERUSE_TIME_TRIGGER_MSEC_DEFAULT)
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecUInt::builder("overuse-threshold")
+                    .nick("Overuse Threshold (msec)")
+                    .blurb("Time above which overuse will not be triggered (Sec 5.4)")
+                    .minimum(1)
+                    .maximum(u32::MAX)
+                    .default_value(MAX_M_MINUS_DEL_VAR_MSEC_DEFAULT)
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecUInt::builder("delay-controller-interval")
+                    .nick("Delay Controller task interval (msec)")
+                    .blurb("Minimum duration between updates on the delay controller")
+                    .minimum(DELAY_UPDATE_INTERVAL_MSEC_DEFAULT)
+                    .maximum(100 * DELAY_UPDATE_INTERVAL_MSEC_DEFAULT)
+                    .default_value(DELAY_UPDATE_INTERVAL_MSEC_DEFAULT)
+                    .mutable_ready()
+                    .build(),
             ]
         });
 
@@ -1386,6 +1445,22 @@ impl ObjectImpl for BandwidthEstimator {
                 let mut state = self.state.lock().unwrap();
                 state.estimator = value.get().unwrap();
                 state.detector.estimator_impl = state.estimator.to_impl()
+            }
+            "burst-time" => {
+                let mut state = self.state.lock().unwrap();
+                state.burst_time_msec = value.get::<u32>().expect("type checked upstream");
+            }
+            "overuse-trigger" => {
+                let mut state = self.state.lock().unwrap();
+                state.overuse_trigger_msec = value.get::<u32>().expect("type checked upstream");
+            }
+            "overuse-threshold" => {
+                let mut state = self.state.lock().unwrap();
+                state.overuse_threshold_msec = value.get::<u32>().expect("type checked upstream");
+            }
+            "delay-controller-interval" => {
+                let mut state = self.state.lock().unwrap();
+                state.delay_controller_interval_msec = value.get::<u32>().expect("type checked upstream");
             }
             _ => unimplemented!(),
         }
@@ -1416,6 +1491,22 @@ impl ObjectImpl for BandwidthEstimator {
             "delay-controller-bitrate" => {
                 let state = self.state.lock().unwrap();
                 state.target_bitrate_on_delay.to_value()
+            }
+            "burst-time" => {
+                let state = self.state.lock().unwrap();
+                state.burst_time_msec.to_value()
+            }
+            "overuse-trigger" => {
+                let state = self.state.lock().unwrap();
+                state.overuse_trigger_msec.to_value()
+            }
+            "overuse-threshold" => {
+                let state = self.state.lock().unwrap();
+                state.overuse_threshold_msec.to_value()
+            }
+            "delay-controller-interval" => {
+                let state = self.state.lock().unwrap();
+                state.delay_controller_interval_msec.to_value()
             }
             _ => unimplemented!(),
         }
