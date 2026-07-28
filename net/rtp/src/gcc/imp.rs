@@ -836,6 +836,7 @@ impl State {
         let now = Instant::now();
         let target_bitrate = self.target_bitrate_on_delay as f64;
         let effective_bitrate = self.detector.effective_bitrate();
+        // Might be interesting to log this...
         let time_since_last_update_ms = match self.last_increase_on_delay {
             None => 0.,
             Some(prev) => {
@@ -846,6 +847,12 @@ impl State {
                 Duration::try_from(now - prev).unwrap().whole_milliseconds() as f64
             }
         };
+
+        gst::info!(
+            CAT,
+            "It's been {} ms since the last update",
+            time_since_last_update_ms
+        );
 
         if effective_bitrate as f64 - target_bitrate > 5. * target_bitrate / 100. {
             gst::info!(
@@ -879,6 +886,16 @@ impl State {
                         160.0,
                     ),
                 ),
+            );
+
+            gst::info!(
+                CAT,
+                "Increased rate: {} br  {} RTT ms   alpha {}   {} ==> {}",
+                effective_bitrate,
+                rtt_ms,
+                alpha,
+                threshold_on_effective_bitrate,
+                increase
             );
 
             /* Additive increase */
