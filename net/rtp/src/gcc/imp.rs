@@ -55,13 +55,14 @@ static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
 });
 
 // Table1. Time limit in milliseconds  between packet bursts which  identifies a group
-const BURST_TIME: Duration = Duration::milliseconds(5);
+// was 5msec
+const BURST_TIME: Duration = Duration::milliseconds(10);
 
 // Table1. Initial value for the adaptive threshold
 const INITIAL_DEL_VAR_TH: Duration = Duration::microseconds(12500);
 
-// Table1. Time required to trigger an overuse signal
-const OVERUSE_TIME_TH: Duration = Duration::milliseconds(10);
+// Table1. Time required to trigger an overuse signal -- was 10msec
+const OVERUSE_TIME_TH: Duration = Duration::milliseconds(100);
 
 // from 5.5 "beta is typically chosen to be in the interval [0.8, 0.95], 0.85 is the RECOMMENDED value."
 const BETA: f64 = 0.85;
@@ -467,6 +468,7 @@ impl Detector {
 
         let mut lost_packets = 0.;
         let n_packets = packets.len();
+
         for pkt in packets {
             // We know feedbacks packets will arrive "soon" after the packets they are reported for or considered
             // lost so we can make the assumption that
@@ -836,7 +838,6 @@ impl State {
         let now = Instant::now();
         let target_bitrate = self.target_bitrate_on_delay as f64;
         let effective_bitrate = self.detector.effective_bitrate();
-        // Might be interesting to log this...
         let time_since_last_update_ms = match self.last_increase_on_delay {
             None => 0.,
             Some(prev) => {
