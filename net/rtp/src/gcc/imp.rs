@@ -1256,7 +1256,8 @@ impl ObjectSubclass for BandwidthEstimator {
                                 gst::debug!(
                                     CAT,
                                     obj = bwe,
-                                    "TWCC Packets {:?}",
+                                    "TWCC Packets {}: {:?}",
+                                    packets.len(),
                                     packets
                                 );
 
