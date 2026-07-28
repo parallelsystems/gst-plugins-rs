@@ -37,6 +37,10 @@ type BufferList = SmallVec<[gst::Buffer; 10]>;
 const EXPECTED_FRAMERATE: f64 = 20.;
 // Bucket size is based on framerate
 const BUCKET_SIZE_DURATION_MSEC: f64 = 1000. / EXPECTED_FRAMERATE;
+// 5.5.  Rate control - The response_time interval
+//    is estimated as the round-trip time plus 100 ms as an estimate of
+//    over-use estimator and detector reaction time.
+const ADDITIVE_INCREASE_ADD_ON_MSEC: f64 = 100;
 
 const DEFAULT_MIN_BITRATE: Bitrate = 1000;
 const DEFAULT_ESTIMATED_BITRATE: Bitrate = 2_048_000;
@@ -860,7 +864,7 @@ impl State {
             let avg_packet_size_bits = bits_per_frame / packets_per_frame;
 
             let rtt_ms = self.detector.rtt().whole_milliseconds() as f64;
-            let response_time_ms = 100. + rtt_ms;
+            let response_time_ms = ADDITIVE_INCREASE_ADD_ON_MSEC + rtt_ms;
             let alpha = 0.5 * f64::min(time_since_last_update_ms / response_time_ms, 1.0);
             let threshold_on_effective_bitrate = 1.5 * effective_bitrate as f64;
             let increase = f64::max(
