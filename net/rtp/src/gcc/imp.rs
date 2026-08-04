@@ -1287,6 +1287,18 @@ impl ObjectImpl for BandwidthEstimator {
                     .default_value(DEFAULT_MIN_BITRATE)
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecUInt::builder("loss-controller-bitrate")
+                    .nick("Loss Est. Bitrate")
+                    .blurb("Estimated bitrate from loss controller")
+                    .default_value(DEFAULT_MIN_BITRATE)
+                    .flags(glib::ParamFlags::READABLE)
+                    .build(),
+                glib::ParamSpecUInt::builder("delay-controller-bitrate")
+                    .nick("Delay Est. Bitrate")
+                    .blurb("Estimated bitrate from delay controller")
+                    .default_value(DEFAULT_MIN_BITRATE)
+                    .flags(glib::ParamFlags::READABLE)
+                    .build(),
                 glib::ParamSpecUInt::builder("min-bitrate")
                     .nick("Minimal Bitrate")
                     .blurb("Minimal bitrate to use (in bit/sec) when computing it through the bandwidth estimation algorithm")
@@ -1357,6 +1369,14 @@ impl ObjectImpl for BandwidthEstimator {
             "estimator" => {
                 let state = self.state.lock().unwrap();
                 state.estimator.to_value()
+            }
+            "loss-controller-bitrate" => {
+                let state = self.state.lock().unwrap();
+                state.target_bitrate_on_loss.to_value()
+            }
+            "delay-controller-bitrate" => {
+                let state = self.state.lock().unwrap();
+                state.target_bitrate_on_delay.to_value()
             }
             _ => unimplemented!(),
         }
