@@ -402,10 +402,8 @@ impl CongestionController {
                 human_bytes::human_bytes(self.min_bitrate),
                 human_bytes::human_bytes(self.max_bitrate),
             );
-        }
-
-        let fec_ratio = {
-            if self.do_fec {
+        
+            let fec_ratio = if self.do_fec {
                 if target_bitrate <= 2000000 || self.max_bitrate <= 2000000 {
                     0f64
                 } else {
@@ -413,17 +411,20 @@ impl CongestionController {
                 }
             } else {
                 0.0
-            }   
-        };
+            };
 
-        let fec_percentage = (fec_ratio * 50f64) as u32;
+            let fec_percentage = (fec_ratio * 50f64) as u32;
 
-        for encoder in encoders.iter_mut() {
-            if encoder.set_bitrate(element, target_bitrate).is_ok() {
-                encoder
-                    .transceiver
-                    .set_property("fec-percentage", fec_percentage);
+            for encoder in encoders.iter_mut() {
+                if encoder.set_bitrate(element, target_bitrate).is_ok() {
+                    encoder
+                        .transceiver
+                        .set_property("fec-percentage", fec_percentage);
+                }
             }
+
+            // Emit a signal through the parent `webrtcsink`
+            element.emit_by_name::<()>("cc-bitrate-changed", &[&(self.target_bitrate_on_delay as u32), &(self.target_bitrate_on_loss as u32), &(target_bitrate as u32)]);
         }
     }
 }
