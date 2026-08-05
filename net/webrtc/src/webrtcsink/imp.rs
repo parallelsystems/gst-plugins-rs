@@ -3103,6 +3103,8 @@ impl BaseWebRTCSink {
                     0f64
                 }
             };
+            // Drop the lock, since `set_bitrate` calls `set_property()`
+            drop(settings);
 
             let fec_percentage = fec_ratio * 50f64;
             let encoders_bitrate =
@@ -4274,6 +4276,18 @@ impl ObjectImpl for BaseWebRTCSink {
                         gst::Caps::static_type(),
                     ])
                     .return_type::<gst::Element>()
+                    .build(),
+                /**
+                 * GstBaseWebRTCSink::cc-bitrate-changed:
+                 * @delay-controller bitrate target
+                 * @loss-controller bitrate target
+                 * @overall bitrate target
+                 *
+                 * This signal is emit by the homegrown `CongestionController` when
+                 * it updates its target bitrates. All bitrates are in bps.
+                 */
+                glib::subclass::Signal::builder("cc-bitrate-changed")
+                    .param_types([u32::static_type(), u32::static_type(), u32::static_type()])
                     .build(),
             ]
         });
