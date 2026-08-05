@@ -3103,6 +3103,8 @@ impl BaseWebRTCSink {
                     0f64
                 }
             };
+            // Drop the lock, since `set_bitrate` calls `set_property()`
+            drop(settings);
 
             let fec_percentage = fec_ratio * 50f64;
             let encoders_bitrate =
