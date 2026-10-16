@@ -97,7 +97,13 @@ pub struct CongestionController {
 }
 
 impl CongestionController {
-    pub fn new(peer_id: &str, min_bitrate: u32, max_bitrate: u32, do_fec: bool, do_apply: bool) -> Self {
+    pub fn new(
+        peer_id: &str,
+        min_bitrate: u32,
+        max_bitrate: u32,
+        do_fec: bool,
+        do_apply: bool,
+    ) -> Self {
         Self {
             target_bitrate_on_delay: 0,
             target_bitrate_on_loss: 0,
@@ -108,7 +114,7 @@ impl CongestionController {
             min_bitrate,
             max_bitrate,
             do_fec,
-            do_apply
+            do_apply,
         }
     }
 
@@ -130,7 +136,8 @@ impl CongestionController {
 
         let sent_minus_received = bitrate_sent.saturating_sub(bitrate_recv);
 
-        let delay_factor = sent_minus_received as f64 / target_bitrate;
+        // @viotovmp - changed divisor from `target_bitrate`
+        let delay_factor = sent_minus_received as f64 / f64::from(bitrate_sent);
         let last_update_time = self.last_update_time.replace(std::time::Instant::now());
 
         gst::trace!(
@@ -210,8 +217,11 @@ impl CongestionController {
                     // seems intuitively much too low, granting disproportionate importance
                     // to the last measurement. 0.5 seems plenty enough, I don't have maths
                     // to back that up though :)
+                    // TODO: @viotovmp - potentially reset to 0.95 from 0.5
                     let alpha = 0.5 * f64::min(time_since_last_update_ms / response_time_ms, 1.0);
-                    let bits_per_frame = target_bitrate / 30.;
+                    // TODO: @viotovmp - 10 should come from the framerate of the stream
+                    let bits_per_frame = target_bitrate / 10.;
+                    // TODO: @viotovmp - 1200 should come from the webrtc mtu
                     let packets_per_frame = f64::ceil(bits_per_frame / (1200. * 8.));
                     let avg_packet_size_bits = bits_per_frame / packets_per_frame;
 
@@ -411,7 +421,8 @@ impl CongestionController {
                         if target_bitrate <= 2000000 || self.max_bitrate <= 2000000 {
                             0f64
                         } else {
-                            (target_bitrate as f64 - 2000000f64) / (self.max_bitrate as f64 - 2000000f64)
+                            (target_bitrate as f64 - 2000000f64)
+                                / (self.max_bitrate as f64 - 2000000f64)
                         }
                     } else {
                         0.0
@@ -430,7 +441,14 @@ impl CongestionController {
             }
 
             // Emit a signal through the parent `webrtcsink`
-            element.emit_by_name::<()>("cc-bitrate-changed", &[&(self.target_bitrate_on_delay as u32), &(self.target_bitrate_on_loss as u32), &(target_bitrate as u32)]);
+            element.emit_by_name::<()>(
+                "cc-bitrate-changed",
+                &[
+                    &(self.target_bitrate_on_delay as u32),
+                    &(self.target_bitrate_on_loss as u32),
+                    &(target_bitrate as u32),
+                ],
+            );
         }
     }
 }
