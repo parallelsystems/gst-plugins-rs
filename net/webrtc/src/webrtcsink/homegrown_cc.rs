@@ -5,8 +5,121 @@ use gst::{
     prelude::*,
 };
 use once_cell::sync::Lazy;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use super::imp::VideoEncoder;
+
+/// The sliding window over which the delay signals are averaged before being
+/// compared against their thresholds is one GOP long, read from the encoders'
+/// keyframe interval and current framerate.
+/// 
+/// The TWCC stats are computed over a short window, and the sender doesn't pace, 
+/// so every packet of a frame gets roughly the same send timestamp while the
+/// receiver sees them spread out by the time it takes the frame to drain 
+/// through the bottleneck. Whenever the newest frame in that window is a keyframe,
+/// bitrate-recv reads noticeably lower than bitrate-sent even on an idle link.
+/// 
+/// Without averaging, that shows up as a spurious decrease once per keyframe.
+/// Averaging over a full GOP weighs the keyframe tick against the rest of the GOP.
+///
+/// No decision is taken until a full window has been collected after each
+/// decrease, so the window is bounded to keep the controller responsive with
+/// long or unbounded GOPs.
+const DEFAULT_DELAY_SIGNAL_WINDOW: Duration = Duration::from_millis(1000);
+/// Lower bound of how short a GOP could realistically be (1/2 a second)
+const MIN_DELAY_SIGNAL_WINDOW: Duration = Duration::from_millis(500);
+/// Upper bound of how long a GOP could realistically be (3 seconds)
+const MAX_DELAY_SIGNAL_WINDOW: Duration = Duration::from_secs(3);
+
+/// Delay signal window covering the longest GOP among the encoders, or the
+/// default when no encoder has a known GOP (automatic or request-only
+/// keyframe placement, variable framerate)
+fn delay_signal_window(encoders: &[VideoEncoder]) -> Duration {
+    encoders
+        .iter()
+        .filter_map(VideoEncoder::gop_duration)
+        .max()
+        .map(|gop| gop.clamp(MIN_DELAY_SIGNAL_WINDOW, MAX_DELAY_SIGNAL_WINDOW))
+        .unwrap_or(DEFAULT_DELAY_SIGNAL_WINDOW)
+}
+
+/// Averaged (sent - recv) / sent above which the delay controller decreases
+const DELAY_FACTOR_THRESHOLD: f64 = 0.1;
+
+/// Averaged avg-delta-of-delta (ns) above which the delay controller decreases
+const DELTA_OF_DELTA_THRESHOLD_NS: f64 = 1_000_000.;
+
+/// Framerate assumed for the additive increase when an encoder's framerate
+/// is unknown (variable framerate, or not negotiated yet)
+const FALLBACK_FRAMERATE: f64 = 20.;
+
+/// Sliding-window average of the delay controller's input signals.
+#[derive(Debug)]
+struct DelaySignals {
+    /// (sample time, signed (sent - recv) / sent, avg-delta-of-delta in ns)
+    samples: VecDeque<(Instant, f64, f64)>,
+    /// When collection started since the last reset
+    since: Option<Instant>,
+    /// Length of the averaging window
+    window: Duration,
+}
+
+impl Default for DelaySignals {
+    fn default() -> Self {
+        Self {
+            samples: VecDeque::new(),
+            since: None,
+            window: DEFAULT_DELAY_SIGNAL_WINDOW,
+        }
+    }
+}
+
+impl DelaySignals {
+    /// Returns whether the window changed. A shorter window drops the
+    /// excess samples on the next push, a longer one delays the next
+    /// decision until it has been filled since the last reset.
+    fn set_window(&mut self, window: Duration) -> bool {
+        std::mem::replace(&mut self.window, window) != window
+    }
+
+    fn push(&mut self, now: Instant, rel_diff: f64, delta_of_delta: f64) {
+        self.since.get_or_insert(now);
+        self.samples.push_back((now, rel_diff, delta_of_delta));
+        while let Some(&(t, ..)) = self.samples.front() {
+            if now.duration_since(t) >= self.window {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Mean (delay_factor, delta_of_delta) over the window, or None until
+    /// samples have been collected for a full window since the last reset.
+    fn averages(&self, now: Instant) -> Option<(f64, f64)> {
+        let since = self.since?;
+        if now.duration_since(since) < self.window || self.samples.is_empty() {
+            return None;
+        }
+
+        let n = self.samples.len() as f64;
+        let (rel_sum, dod_sum) = self
+            .samples
+            .iter()
+            .fold((0., 0.), |(r, d), &(_, rel, dod)| (r + rel, d + dod));
+
+        Some((rel_sum / n, dod_sum / n))
+    }
+
+    /// Drop all samples, e.g. after a decrease: samples taken at the old
+    /// bitrate say nothing about the new one, and keeping them would make
+    /// the controller cut again on every tick until they age out.
+    fn reset(&mut self) {
+        self.samples.clear();
+        self.since = None;
+    }
+}
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
@@ -87,6 +200,8 @@ pub struct CongestionController {
     /// Used in additive mode to track last control time, influences
     /// calculation of added value according to gcc section 5.5
     last_update_time: Option<std::time::Instant>,
+    /// Delay signals averaged over a GOP-long window before thresholding
+    delay_signals: DelaySignals,
     /// For logging purposes
     peer_id: String,
 
@@ -96,13 +211,19 @@ pub struct CongestionController {
 }
 
 impl CongestionController {
-    pub fn new(peer_id: &str, min_bitrate: u32, max_bitrate: u32, do_fec: bool) -> Self {
+    pub fn new(
+        peer_id: &str,
+        min_bitrate: u32,
+        max_bitrate: u32,
+        do_fec: bool,
+    ) -> Self {
         Self {
             target_bitrate_on_delay: 0,
             target_bitrate_on_loss: 0,
             bitrate_ema: None,
             bitrate_emvar: 0.,
             last_update_time: None,
+            delay_signals: DelaySignals::default(),
             peer_id: peer_id.to_string(),
             min_bitrate,
             max_bitrate,
@@ -115,6 +236,7 @@ impl CongestionController {
         element: &super::BaseWebRTCSink,
         twcc_stats: &gst::StructureRef,
         rtt: f64,
+        encoders: &[VideoEncoder],
     ) -> CongestionControlOp {
         let target_bitrate = f64::min(
             self.target_bitrate_on_delay as f64,
@@ -126,10 +248,19 @@ impl CongestionController {
         let bitrate_recv = twcc_stats.get::<u32>("bitrate-recv").unwrap();
         let delta_of_delta = twcc_stats.get::<i64>("avg-delta-of-delta").unwrap();
 
-        let sent_minus_received = bitrate_sent.saturating_sub(bitrate_recv);
+        let now = Instant::now();
+        let last_update_time = self.last_update_time.replace(now);
 
-        let delay_factor = sent_minus_received as f64 / target_bitrate;
-        let last_update_time = self.last_update_time.replace(std::time::Instant::now());
+        let delay_duration = delay_signal_window(encoders);
+        if self.delay_signals.set_window(delay_duration) {
+            gst::debug!(
+                CAT,
+                obj = element,
+                "consumer {}: delay signal window now {:?}",
+                self.peer_id,
+                self.delay_signals.window
+            );
+        }
 
         gst::trace!(
             CAT,
@@ -139,7 +270,39 @@ impl CongestionController {
             twcc_stats
         );
 
-        if delay_factor > 0.1 {
+        // Signed on purpose: burst-drain artifacts push recv both above and
+        // below sent, and only a sustained excess of sent over recv means
+        // congestion. Clamping each sample to >= 0 (saturating_sub) before
+        // averaging would turn that zero-mean noise into a positive bias.
+        if bitrate_sent > 0 {
+            // Normalized by `bitrate_sent` instead of `target_bitrate`
+            let rel_diff =
+                (f64::from(bitrate_sent) - f64::from(bitrate_recv)) / f64::from(bitrate_sent);
+            self.delay_signals
+                .push(now, rel_diff, delta_of_delta as f64);
+        }
+
+        let Some((delay_factor, delta_of_delta)) = self.delay_signals.averages(now) else {
+            gst::trace!(
+                CAT,
+                obj = element,
+                "consumer {}: collecting delay samples, holding",
+                self.peer_id
+            );
+            return CongestionControlOp::Hold;
+        };
+
+        gst::trace!(
+            CAT,
+            obj = element,
+            "consumer {}: averaged delay factor {:.4}, delta-of-delta {:.0} ns over {} samples",
+            self.peer_id,
+            delay_factor,
+            delta_of_delta,
+            self.delay_signals.samples.len()
+        );
+
+        if delay_factor > DELAY_FACTOR_THRESHOLD {
             let (factor, reason) = if delay_factor < 0.64 {
                 (0.96, format!("low delay factor {delay_factor}"))
             } else {
@@ -149,8 +312,10 @@ impl CongestionController {
                 )
             };
 
+            self.delay_signals.reset();
             CongestionControlOp::Decrease { factor, reason }
-        } else if delta_of_delta > 1_000_000 {
+        } else if delta_of_delta > DELTA_OF_DELTA_THRESHOLD_NS {
+            self.delay_signals.reset();
             CongestionControlOp::Decrease {
                 factor: 0.97,
                 reason: format!("High delta: {delta_of_delta}"),
@@ -197,7 +362,8 @@ impl CongestionController {
                     IncreaseType::Multiplicative(1.03)
                 } else {
                     let rtt_ms = rtt * 1000.;
-                    let response_time_ms = 100. + rtt_ms;
+                    // Response time is the rtt + the detector's time to react
+                    let response_time_ms = delay_duration.as_millis() as f64 + rtt_ms;
                     let time_since_last_update_ms = match last_update_time {
                         None => 0.,
                         Some(instant) => {
@@ -209,9 +375,8 @@ impl CongestionController {
                     // to the last measurement. 0.5 seems plenty enough, I don't have maths
                     // to back that up though :)
                     let alpha = 0.5 * f64::min(time_since_last_update_ms / response_time_ms, 1.0);
-                    let bits_per_frame = target_bitrate / 30.;
-                    let packets_per_frame = f64::ceil(bits_per_frame / (1200. * 8.));
-                    let avg_packet_size_bits = bits_per_frame / packets_per_frame;
+                    let avg_packet_size_bits =
+                        self.avg_packet_size_bits(element, target_bitrate, encoders);
 
                     gst::trace!(
                         CAT,
@@ -234,6 +399,45 @@ impl CongestionController {
                 IncreaseType::Multiplicative(1.03)
             })
         }
+    }
+
+    /// Expected average RTP packet size in bits, averaged over the encoders.
+    /// target_bitrate is the total for all encoders and is split equally,
+    /// as in apply_control_op.
+    fn avg_packet_size_bits(
+        &self,
+        element: &super::BaseWebRTCSink,
+        target_bitrate: f64,
+        encoders: &[VideoEncoder],
+    ) -> f64 {
+        if encoders.is_empty() {
+            return 0.;
+        }
+
+        let bitrate_per_encoder = target_bitrate / encoders.len() as f64;
+        let sum: f64 = encoders
+            .iter()
+            .map(|encoder| {
+                let framerate = encoder.framerate().unwrap_or(FALLBACK_FRAMERATE);
+                let mtu_bits = f64::from(encoder.mtu()) * 8.;
+                let bits_per_frame = bitrate_per_encoder / framerate;
+                let packets_per_frame = f64::max(1., f64::ceil(bits_per_frame / mtu_bits));
+
+                gst::trace!(
+                    CAT,
+                    obj = element,
+                    "consumer {}: framerate {}, mtu {}, {} packets per frame",
+                    self.peer_id,
+                    framerate,
+                    encoder.mtu(),
+                    packets_per_frame
+                );
+
+                bits_per_frame / packets_per_frame
+            })
+            .sum();
+
+        sum / encoders.len() as f64
     }
 
     fn clamp_bitrate(&mut self, bitrate: i32, n_encoders: i32, controller_type: ControllerType) {
@@ -323,7 +527,7 @@ impl CongestionController {
         encoders: &mut [VideoEncoder],
     ) {
         if let Some(twcc_stats) = lookup_twcc_stats(stats) {
-            let op = self.update_delay(element, &twcc_stats, self.lookup_rtt(stats));
+            let op = self.update_delay(element, &twcc_stats, self.lookup_rtt(stats), encoders);
             self.apply_control_op(element, encoders, op, ControllerType::Delay);
         }
     }
@@ -402,15 +606,18 @@ impl CongestionController {
                 human_bytes::human_bytes(self.min_bitrate),
                 human_bytes::human_bytes(self.max_bitrate),
             );
-        
-            let fec_ratio = if self.do_fec {
-                if target_bitrate <= 2000000 || self.max_bitrate <= 2000000 {
-                    0f64
+
+            let fec_ratio = {
+                if self.do_fec {
+                    if target_bitrate <= 2000000 || self.max_bitrate <= 2000000 {
+                        0f64
+                    } else {
+                        (target_bitrate as f64 - 2000000f64)
+                            / (self.max_bitrate as f64 - 2000000f64)
+                    }
                 } else {
-                    (target_bitrate as f64 - 2000000f64) / (self.max_bitrate as f64 - 2000000f64)
+                    0.0
                 }
-            } else {
-                0.0
             };
 
             let fec_percentage = (fec_ratio * 50f64) as u32;
@@ -424,7 +631,14 @@ impl CongestionController {
             }
 
             // Emit a signal through the parent `webrtcsink`
-            element.emit_by_name::<()>("cc-bitrate-changed", &[&(self.target_bitrate_on_delay as u32), &(self.target_bitrate_on_loss as u32), &(target_bitrate as u32)]);
+            element.emit_by_name::<()>(
+                "cc-bitrate-changed",
+                &[
+                    &(self.target_bitrate_on_delay as u32),
+                    &(self.target_bitrate_on_loss as u32),
+                    &(target_bitrate as u32),
+                ],
+            );
         }
     }
 }
