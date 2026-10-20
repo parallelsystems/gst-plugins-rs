@@ -257,6 +257,8 @@ pub struct VideoEncoder {
     pub transceiver: gst_webrtc::WebRTCRTPTransceiver,
     /// name of the sink pad feeding this encoder
     stream_name: String,
+    /// RTP-level MTU of the payloader, read once after payloader-setup
+    mtu: u32,
 }
 
 struct SessionInner {
@@ -858,6 +860,7 @@ impl VideoEncoder {
         codec_name: &str,
         transceiver: gst_webrtc::WebRTCRTPTransceiver,
         stream_name: String,
+        mtu: u32,
     ) -> Option<Self> {
         let halved_framerate = video_info.fps().mul(gst::Fraction::new(1, 2));
         Some(Self {
@@ -871,7 +874,86 @@ impl VideoEncoder {
             mitigation_mode: WebRTCSinkMitigationMode::NONE,
             transceiver,
             stream_name,
+            mtu,
         })
+    }
+
+    /// Framerate the encoder is actually being fed, i.e. after videorate and
+    /// any dynamic decimation applied through the raw capsfilter. Falls back
+    /// to the input framerate before negotiation, None for variable framerate.
+    pub(crate) fn framerate(&self) -> Option<f64> {
+        let negotiated = self
+            .element
+            .static_pad("sink")
+            .and_then(|pad| pad.current_caps())
+            .and_then(|caps| {
+                caps.structure(0)
+                    .and_then(|s| s.get::<gst::Fraction>("framerate").ok())
+            });
+
+        [negotiated, Some(self.video_info.fps())]
+            .into_iter()
+            .flatten()
+            .find(|fps| fps.numer() > 0 && fps.denom() > 0)
+            .map(|fps| fps.numer() as f64 / fps.denom() as f64)
+    }
+
+    pub(crate) fn mtu(&self) -> u32 {
+        self.mtu
+    }
+
+    /// Distance in frames between intra frames as configured on the encoder,
+    /// None when the encoder places them automatically or never inserts them
+    /// on its own (keyframes are then only produced on request).
+    pub(crate) fn keyframe_interval(&self) -> Option<u64> {
+        let positive_property = |name: &str| -> Option<u64> {
+            self.element.find_property(name)?;
+            let value = self.element.property_value(name);
+            let interval = if let Ok(v) = value.get::<u32>() {
+                u64::from(v)
+            } else if let Ok(v) = value.get::<i32>() {
+                u64::try_from(v).ok()?
+            } else if let Ok(v) = value.get::<u64>() {
+                v
+            } else {
+                u64::try_from(value.get::<i64>().ok()?).ok()?
+            };
+            (interval > 0).then_some(interval)
+        };
+
+        match self.factory_name.as_str() {
+            "vp8enc" | "vp9enc" => {
+                let mode = self.element.property_value("keyframe-mode");
+                if glib::EnumValue::from_value(&mode).is_some_and(|(_, v)| v.nick() == "disabled") {
+                    return None;
+                }
+                positive_property("keyframe-max-dist")
+            }
+            "av1enc" => positive_property("keyframe-max-dist"),
+            "x264enc" => positive_property("key-int-max"),
+            "nvh264enc" | "nvav1enc" | "qsvh264enc" | "vpuenc_h264" => {
+                positive_property("gop-size")
+            }
+            "vaapih264enc" | "vaapivp8enc" => positive_property("keyframe-period"),
+            "rav1enc" => positive_property("max-key-frame-interval"),
+            // Set to the shorter of the two intervals
+            "nvv4l2h264enc" | "nvv4l2h265enc" | "nvv4l2vp8enc" | "nvv4l2vp9enc"
+            | "nvv4l2av1enc" => [
+                positive_property("iframeinterval"),
+                positive_property("idrinterval"),
+            ]
+            .into_iter()
+            .flatten()
+            .min(),
+            _ => None,
+        }
+    }
+
+    /// Duration of a GOP at the framerate the encoder is currently fed
+    pub(crate) fn gop_duration(&self) -> Option<std::time::Duration> {
+        let frames = self.keyframe_interval()? as f64;
+        let secs = frames / self.framerate()?;
+        std::time::Duration::try_from_secs_f64(secs).ok()
     }
 
     fn is_bitrate_supported(factory_name: &str) -> bool {
@@ -1300,6 +1382,7 @@ impl SessionInner {
                 codec.caps.structure(0).unwrap().name(),
                 transceiver,
                 stream_name.clone(),
+                payloader.property::<u32>("mtu"),
             ) {
                 match self.cc_info.heuristic {
                     WebRTCSinkCongestionControl::Disabled => {
