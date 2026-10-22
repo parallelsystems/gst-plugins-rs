@@ -85,6 +85,30 @@ const MAX_THRESHOLD: Duration = Duration::milliseconds(600);
 // From 5.5 ""Close" is defined as three standard deviations around this average"
 const STANDARD_DEVIATION_CLOSE_NUM: f64 = 3.;
 
+// Lower bound on the standard deviation used for "close", as a fraction of
+// the average, so an average built from one or two decreases isn't nearly
+// zero wide
+const MIN_STANDARD_DEVIATION_RATIO: f64 = 0.05;
+
+// Time without a delay decrease after which the average is discarded and
+// the delay controller increases multiplicatively again. The receive rate
+// follows the target, so once the average is set it tends to stay "close"
+// and keep the controller in additive mode long after capacity has moved.
+const CONGESTION_WINDOW_EXPIRY: Duration = Duration::seconds(5);
+
+// Additive increase (5.5), as a rate: about one expected packet per
+// response time, at least MIN_ADDITIVE_INCREASE_BPS_PER_SEC, scaled to the
+// time since the last increase (at most MAX_INCREASE_INTERVAL)
+const MIN_ADDITIVE_INCREASE_BPS_PER_SEC: f64 = 10_000.;
+const RESPONSE_TIME_BASE: Duration = Duration::milliseconds(100);
+const MAX_INCREASE_INTERVAL: Duration = Duration::seconds(1);
+
+// How far above the applied target the loss controller's target may climb.
+// It increases on every update without loss, and when it isn't the lower of
+// the two targets nothing else holds it back: left alone it runs away to
+// max-bitrate, and a loss episode then takes several cuts to bite.
+const LOSS_TARGET_HEADROOM: f64 = 1.1;
+
 // Minimal duration between 2 updates on the lost based rate controller
 const LOSS_UPDATE_INTERVAL: Duration = Duration::milliseconds(200);
 const LOSS_DECREASE_THRESHOLD: f64 = 0.1;
@@ -694,8 +718,9 @@ impl ExponentialMovingAverage {
 
     fn estimate_is_close(&self, value: Bitrate) -> bool {
         self.average.is_some_and(|avg| {
-            ((avg - STANDARD_DEVIATION_CLOSE_NUM * self.standard_dev)
-                ..(avg + STANDARD_DEVIATION_CLOSE_NUM * self.standard_dev))
+            let standard_dev = f64::max(self.standard_dev, MIN_STANDARD_DEVIATION_RATIO * avg);
+            ((avg - STANDARD_DEVIATION_CLOSE_NUM * standard_dev)
+                ..(avg + STANDARD_DEVIATION_CLOSE_NUM * standard_dev))
                 .contains(&(value as f64))
         })
     }
@@ -860,27 +885,41 @@ impl State {
         }
 
         self.last_increase_on_delay = Some(now);
+        if self.ema.average.is_some()
+            && now - self.last_decrease_on_delay > CONGESTION_WINDOW_EXPIRY
+        {
+            gst::debug!(
+                CAT,
+                obj = bwe,
+                "No delay decrease for {CONGESTION_WINDOW_EXPIRY}, discarding the average"
+            );
+            self.ema = Default::default();
+        }
         if self.ema.estimate_is_close(effective_bitrate) {
             let bits_per_frame = target_bitrate / self.framerate;
             let packets_per_frame =
                 f64::max(1., f64::ceil(bits_per_frame / (self.mtu as f64 * 8.)));
             let avg_packet_size_bits = bits_per_frame / packets_per_frame;
 
-            let rtt_ms = self.detector.rtt().whole_milliseconds() as f64;
-            let response_time_ms = 100. + rtt_ms;
-            let alpha = 0.5 * f64::min(time_since_last_update_ms / response_time_ms, 1.0);
+            let response_time_secs =
+                RESPONSE_TIME_BASE.as_seconds_f64() + self.detector.rtt().as_seconds_f64();
+            let rate_bps_per_sec = f64::max(
+                MIN_ADDITIVE_INCREASE_BPS_PER_SEC,
+                avg_packet_size_bits / response_time_secs,
+            );
+            let interval_secs = f64::min(
+                time_since_last_update_ms / 1000.,
+                MAX_INCREASE_INTERVAL.as_seconds_f64(),
+            );
             let threshold_on_effective_bitrate = 1.5 * effective_bitrate as f64;
-            let increase = f64::max(
-                1000.0f64,
-                f64::min(
-                    alpha * avg_packet_size_bits,
-                    // Stuffing should ensure that the effective bitrate is not
-                    // < target bitrate, still, make sure to always increase
-                    // the bitrate by a minimum amount of 160.bits
-                    f64::max(
-                        threshold_on_effective_bitrate - self.target_bitrate_on_delay as f64,
-                        160.0,
-                    ),
+            let increase = f64::min(
+                rate_bps_per_sec * interval_secs,
+                // Stuffing should ensure that the effective bitrate is not
+                // < target bitrate, still, make sure to always increase
+                // the bitrate by a minimum amount of 160.bits
+                f64::max(
+                    threshold_on_effective_bitrate - self.target_bitrate_on_delay as f64,
+                    160.0,
                 ),
             );
 
@@ -1008,11 +1047,16 @@ impl State {
             self.last_control_op = BandwidthEstimationOp::Increase("Low loss".into());
             self.last_increase_on_loss = now;
 
-            self.set_bitrate(
-                bwe,
-                (self.target_bitrate_on_loss as f64 * LOSS_INCREASE_FACTOR) as Bitrate,
-                ControllerType::Loss,
-            )
+            // Kept within LOSS_TARGET_HEADROOM of the applied target. This can
+            // also pull the loss target down, when the delay controller has
+            // lowered the applied target since.
+            let applied = Bitrate::min(self.target_bitrate_on_delay, self.target_bitrate_on_loss);
+            let increased = f64::min(
+                self.target_bitrate_on_loss as f64 * LOSS_INCREASE_FACTOR,
+                applied as f64 * LOSS_TARGET_HEADROOM,
+            );
+
+            self.set_bitrate(bwe, increased as Bitrate, ControllerType::Loss)
         } else {
             false
         }
