@@ -19,8 +19,21 @@
 //!   clean delta frames are the sender's bursts overflowing a shallow
 //!   buffer, which cutting the bitrate doesn't help.
 
+use once_cell::sync::Lazy;
 use std::collections::VecDeque;
 use std::time::Duration;
+
+static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
+    gst::DebugCategory::new(
+        "webrtcsink-packetfeedback",
+        gst::DebugColorFlags::empty(),
+        Some("WebRTC sink per-packet congestion signals"),
+    )
+});
+
+fn ms(ns: impl Into<f64>) -> f64 {
+    ns.into() / 1e6
+}
 
 /// Window over which the smallest one-way delay is taken as the delay of
 /// an empty queue
@@ -116,16 +129,26 @@ impl FeedbackPacket {
 
 /// Parses an `RTPPacerFeedback` structure, packets in TWCC order
 pub(crate) fn parse(feedback: &gst::StructureRef) -> Vec<FeedbackPacket> {
-    feedback
-        .get::<gst::ArrayRef>("packets")
-        .map(|packets| {
-            packets
-                .iter()
-                .filter_map(|v| v.get::<gst::Structure>().ok())
-                .filter_map(|s| FeedbackPacket::from_structure(&s))
-                .collect()
-        })
-        .unwrap_or_default()
+    let Ok(packets) = feedback.get::<gst::ArrayRef>("packets") else {
+        gst::warning!(CAT, "Feedback without packets: {feedback}");
+        return Vec::new();
+    };
+
+    let parsed = packets
+        .iter()
+        .filter_map(|v| v.get::<gst::Structure>().ok())
+        .filter_map(|s| FeedbackPacket::from_structure(&s))
+        .collect::<Vec<_>>();
+    if parsed.len() != packets.len() {
+        gst::debug!(
+            CAT,
+            "{} of {} feedback packets couldn't be parsed",
+            packets.len() - parsed.len(),
+            packets.len()
+        );
+    }
+
+    parsed
 }
 
 /// What one feedback says about the network
@@ -182,13 +205,27 @@ impl Drain {
     /// for longer than the burst explains
     fn overdue(&self, arrival: i64, capacity: Option<f64>) -> bool {
         let elapsed = arrival - self.start_arrival;
-        match capacity {
-            Some(capacity) => {
-                let expected = self.bytes as f64 * 8. / capacity * 1e9;
-                elapsed as f64 > expected * DRAIN_MARGIN + DRAIN_SLACK_NS
-            }
+        match self.expected_ns(capacity) {
+            Some(expected) => elapsed as f64 > expected * DRAIN_MARGIN + DRAIN_SLACK_NS,
             None => elapsed > MAX_DRAIN_NS,
         }
+    }
+
+    /// How long the bytes of the burst and of what queued behind it take
+    /// at `capacity`
+    fn expected_ns(&self, capacity: Option<f64>) -> Option<f64> {
+        capacity.map(|capacity| self.bytes as f64 * 8. / capacity * 1e9)
+    }
+
+    fn log_overrun(&self, arrival: i64, capacity: Option<f64>, what: &str) {
+        gst::debug!(
+            CAT,
+            "{what}: draining for {:.1} ms, its {} bytes need {:?} ms at capacity {:?}",
+            ms((arrival - self.start_arrival) as f64),
+            self.bytes,
+            self.expected_ns(capacity).map(ms),
+            capacity,
+        );
     }
 }
 
@@ -269,7 +306,16 @@ impl PacketDetector {
             if p.is_burst() {
                 match self.drain.as_mut() {
                     Some(drain) => drain.add(p, arrival),
-                    None => self.drain = Some(Drain::new(p, arrival)),
+                    None => {
+                        gst::trace!(
+                            CAT,
+                            "burst starts draining with a {:?} packet (keyframe {}, large frame {})",
+                            p.kind,
+                            p.keyframe,
+                            p.large_frame,
+                        );
+                        self.drain = Some(Drain::new(p, arrival));
+                    }
                 }
                 continue;
             }
@@ -289,6 +335,11 @@ impl PacketDetector {
                 }
 
                 if back_to_back {
+                    drain.log_overrun(
+                        arrival,
+                        self.capacity,
+                        "delta frames still queued behind a burst",
+                    );
                     signals.drain_overrun = true;
                 }
                 let drain = self.drain.take().unwrap();
@@ -300,11 +351,22 @@ impl PacketDetector {
                 self.last_delta_frame = p.frame;
                 if let Some(base) = self.base_delay.get() {
                     let queue_delay = (owd - base) as f64;
-                    self.queue_delay_ns = Some(match self.queue_delay_ns {
+                    let smoothed = match self.queue_delay_ns {
                         Some(avg) => avg + QUEUE_DELAY_ALPHA * (queue_delay - avg),
                         None => queue_delay,
-                    });
+                    };
+                    self.queue_delay_ns = Some(smoothed);
                     signals.delay_samples += 1;
+                    gst::trace!(
+                        CAT,
+                        "delta frame {:?}: queuing delay {:.2} ms (one-way {:.2} ms over a base \
+                         of {:.2} ms), smoothed {:.2} ms",
+                        p.frame,
+                        ms(queue_delay),
+                        ms(owd as f64),
+                        ms(base as f64),
+                        ms(smoothed),
+                    );
                 }
             }
         }
@@ -312,6 +374,7 @@ impl PacketDetector {
         // A burst still draining long after it should be through
         if let (Some(drain), Some(last_arrival)) = (self.drain.as_ref(), self.last_arrival) {
             if drain.overdue(last_arrival, self.capacity) {
+                drain.log_overrun(last_arrival, self.capacity, "burst still draining");
                 signals.drain_overrun = true;
             }
         }
@@ -328,24 +391,48 @@ impl PacketDetector {
         let send_spread = drain.last_send - drain.first_send;
         let bytes = drain.bytes - u64::from(drain.first_size);
         if bytes < MIN_CAPACITY_SAMPLE_BYTES || arrival_spread < MIN_CAPACITY_SAMPLE_NS {
+            gst::trace!(
+                CAT,
+                "burst drained: {} bytes over {:.1} ms, too small to measure the capacity",
+                drain.bytes,
+                ms(arrival_spread as f64),
+            );
             return;
         }
 
         let sample = bytes as f64 * 8. / arrival_spread as f64 * 1e9;
+        let queue_limited = arrival_spread as f64 > QUEUE_LIMITED_SPREAD * send_spread as f64;
+        let previous = self.capacity;
         self.capacity = Some(match self.capacity {
             // The bottleneck spread the burst out: that's its rate
-            Some(capacity) if arrival_spread as f64 > QUEUE_LIMITED_SPREAD * send_spread as f64 => {
-                capacity + CAPACITY_ALPHA * (sample - capacity)
-            }
+            Some(capacity) if queue_limited => capacity + CAPACITY_ALPHA * (sample - capacity),
             // The pacer spread it out: the link can do at least that much
             Some(capacity) => capacity.max(sample),
             None => sample,
         });
+
+        gst::debug!(
+            CAT,
+            "burst drained: {} bytes arrived over {:.1} ms, sent over {:.1} ms ({}), \
+             {:.0} bit/s: capacity {:?} -> {:?}",
+            drain.bytes,
+            ms(arrival_spread as f64),
+            ms(send_spread as f64),
+            if queue_limited {
+                "spread out by the bottleneck"
+            } else {
+                "spread out by the pacer, a lower bound"
+            },
+            sample,
+            previous,
+            self.capacity,
+        );
     }
 
     /// Forget the queue state, e.g. after a decrease: the next samples
     /// should reflect the new bitrate
     pub fn reset_queue_delay(&mut self) {
+        gst::trace!(CAT, "queuing delay reset");
         self.queue_delay_ns = None;
     }
 }

@@ -410,6 +410,9 @@ pub struct CongestionController {
     detector: PacketDetector,
     /// Last time per-packet feedback came in
     last_packet_feedback: Option<Instant>,
+    /// Whether the controller ran on per-packet feedback last time it
+    /// decided, to log when it switches
+    on_packet_feedback: bool,
     /// Delta frame packets reported, and lost, since the loss controller's
     /// last decision
     delta_packets: usize,
@@ -449,6 +452,7 @@ impl CongestionController {
             pacer,
             detector: PacketDetector::default(),
             last_packet_feedback: None,
+            on_packet_feedback: false,
             delta_packets: 0,
             delta_lost: 0,
             rtx_rate: 0.,
@@ -860,6 +864,16 @@ impl CongestionController {
         if self.packet_level() {
             return;
         }
+        if self.on_packet_feedback {
+            self.on_packet_feedback = false;
+            gst::info!(
+                CAT,
+                obj = element,
+                "consumer {}: no per-packet feedback for {:?}, back on aggregate TWCC stats",
+                self.peer_id,
+                PACKET_FEEDBACK_TIMEOUT
+            );
+        }
 
         if let Some(twcc_stats) = lookup_twcc_stats(stats) {
             let op = self.update_delay(element, &twcc_stats, self.rtt, encoders);
@@ -878,14 +892,36 @@ impl CongestionController {
         self.update_pacer_params(encoders);
 
         let packets = packet_feedback::parse(feedback);
+        let unknown = packets
+            .iter()
+            .filter(|p| p.kind == PacketKind::Unknown)
+            .count();
         // Until the pacer lines the feedback up with what it sent, it can't
         // tell what the packets were
-        if packets.iter().all(|p| p.kind == PacketKind::Unknown) {
+        if unknown == packets.len() {
+            gst::log!(
+                CAT,
+                obj = element,
+                "consumer {}: pacer can't tell what the {} packets of this feedback were, skipping it",
+                self.peer_id,
+                packets.len()
+            );
             return;
+        }
+        if unknown > 0 {
+            gst::debug!(
+                CAT,
+                obj = element,
+                "consumer {}: {unknown} of {} feedback packets unknown to the pacer, \
+                 left out of the signals",
+                self.peer_id,
+                packets.len()
+            );
         }
 
         let now = Instant::now();
-        if !self.packet_level() {
+        if !self.on_packet_feedback {
+            self.on_packet_feedback = true;
             gst::info!(
                 CAT,
                 obj = element,
@@ -937,6 +973,16 @@ impl CongestionController {
         self.delta_lost += signals.delta_lost;
         if self.delta_packets >= MIN_LOSS_PACKETS {
             let loss_percentage = 100. * self.delta_lost as f64 / self.delta_packets as f64;
+            if self.delta_lost > 0 {
+                gst::debug!(
+                    CAT,
+                    obj = element,
+                    "consumer {}: delta frame loss {loss_percentage:.1}% ({} of {} packets)",
+                    self.peer_id,
+                    self.delta_lost,
+                    self.delta_packets,
+                );
+            }
             self.delta_packets = 0;
             self.delta_lost = 0;
             let op = self.loss_op(element, loss_percentage);
@@ -957,6 +1003,12 @@ impl CongestionController {
         let interval_secs = increase_interval_secs(self.last_update_time.replace(now), now);
 
         let Some(queue_delay) = signals.queue_delay else {
+            gst::trace!(
+                CAT,
+                obj = element,
+                "consumer {}: no delta frame delay sample yet, holding",
+                self.peer_id
+            );
             return CongestionControlOp::Hold;
         };
 
@@ -974,6 +1026,16 @@ impl CongestionController {
 
         if signals.drain_overrun || queue_delay > QUEUE_DELAY_OVERUSE {
             if settling {
+                gst::debug!(
+                    CAT,
+                    obj = element,
+                    "consumer {}: congested (queue delay {:?}, drain overrun {}) but still \
+                     settling after the last decrease ({:.0} ms), holding",
+                    self.peer_id,
+                    queue_delay,
+                    signals.drain_overrun,
+                    settle * 1000.,
+                );
                 return CongestionControlOp::Hold;
             }
 
@@ -983,6 +1045,20 @@ impl CongestionController {
                 factor = factor.min(CAPACITY_TARGET_RATIO * capacity / current);
             }
             let factor = factor.max(MIN_DELAY_DECREASE_FACTOR);
+
+            gst::debug!(
+                CAT,
+                obj = element,
+                "consumer {}: congested, queue delay {:?} (overuse above {:?}), drain overrun {}, \
+                 capacity {:?}: cutting delay target {:.0} by {:.3}",
+                self.peer_id,
+                queue_delay,
+                QUEUE_DELAY_OVERUSE,
+                signals.drain_overrun,
+                signals.capacity,
+                current,
+                factor,
+            );
 
             self.detector.reset_queue_delay();
             return CongestionControlOp::Decrease {
@@ -996,6 +1072,15 @@ impl CongestionController {
         }
 
         if settling || queue_delay > QUEUE_DELAY_NORMAL {
+            gst::trace!(
+                CAT,
+                obj = element,
+                "consumer {}: holding, queue delay {:?} (increase at or below {:?}), settling {}",
+                self.peer_id,
+                queue_delay,
+                QUEUE_DELAY_NORMAL,
+                settling,
+            );
             return CongestionControlOp::Hold;
         }
 
@@ -1014,6 +1099,12 @@ impl CongestionController {
             .reduce(f64::min)
         {
             if (pacer.property::<f64>("framerate") - framerate).abs() > 0.01 {
+                gst::debug!(
+                    CAT,
+                    obj = pacer,
+                    "consumer {}: encoders run at {framerate} fps, telling the pacer",
+                    self.peer_id
+                );
                 pacer.set_property("framerate", framerate.clamp(1., 1000.));
             }
         }
@@ -1025,6 +1116,12 @@ impl CongestionController {
         {
             let gop_size = u32::try_from(gop_size).unwrap_or(u32::MAX);
             if pacer.property::<u32>("gop-size") != gop_size {
+                gst::debug!(
+                    CAT,
+                    obj = pacer,
+                    "consumer {}: encoders' GOP is {gop_size} frames, telling the pacer",
+                    self.peer_id
+                );
                 pacer.set_property("gop-size", gop_size);
             }
         }
@@ -1144,6 +1241,18 @@ impl CongestionController {
         if total_bitrate != prev_bitrate {
             if let Some(pacer) = self.pacer.as_ref() {
                 pacer.set_property("bitrate", total_bitrate.max(1) as u32);
+            }
+
+            if self.rtx_rate >= 1. {
+                gst::debug!(
+                    CAT,
+                    obj = element,
+                    "consumer {}: encoders get {:.0} in total: target {} minus {:.0} of retransmissions",
+                    self.peer_id,
+                    encoders_bitrate,
+                    total_bitrate,
+                    self.rtx_rate,
+                );
             }
 
             gst::info!(
