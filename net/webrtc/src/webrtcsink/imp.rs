@@ -852,6 +852,47 @@ impl PayloadChainBuilder {
     }
 }
 
+/// Framerate and MTU for rtpgccbwe: the lowest of each among the encoders,
+/// None when no encoder knows yet
+#[cfg(feature = "v1_22")]
+#[derive(Debug, Clone, Copy, Default)]
+struct GccStreamParams {
+    framerate: Option<f64>,
+    mtu: Option<u32>,
+}
+
+#[cfg(feature = "v1_22")]
+impl GccStreamParams {
+    fn from_encoders(encoders: &[VideoEncoder]) -> Self {
+        Self {
+            framerate: encoders
+                .iter()
+                .filter_map(VideoEncoder::framerate)
+                .reduce(f64::min),
+            mtu: encoders.iter().map(VideoEncoder::mtu).min(),
+        }
+    }
+
+    /// Sets the params that changed on `rtpgccbwe`, if it has them (older
+    /// versions of the element don't)
+    fn apply(&self, rtpgccbwe: &gst::Element) {
+        if let Some(framerate) = self.framerate {
+            if rtpgccbwe.has_property("framerate", Some(f64::static_type()))
+                && (rtpgccbwe.property::<f64>("framerate") - framerate).abs() > 0.01
+            {
+                rtpgccbwe.set_property("framerate", framerate);
+            }
+        }
+        if let Some(mtu) = self.mtu {
+            if rtpgccbwe.has_property("mtu", Some(u32::static_type()))
+                && rtpgccbwe.property::<u32>("mtu") != mtu
+            {
+                rtpgccbwe.set_property("mtu", mtu);
+            }
+        }
+    }
+}
+
 impl VideoEncoder {
     fn new(
         encoding_elements: &EncodingChain,
@@ -984,9 +1025,8 @@ impl VideoEncoder {
             "av1enc" => (self.element.property::<u32>("target-bitrate") * 1000) as i32,
             "x264enc" | "nvh264enc" | "vaapih264enc" | "vaapivp8enc" | "qsvh264enc"
             | "nvav1enc" | "vpuenc_h264" => (self.element.property::<u32>("bitrate") * 1000) as i32,
-            "nvv4l2h264enc" | "nvv4l2h265enc" | "nvv4l2vp8enc" | "nvv4l2vp9enc" | "rav1enc" | "nvv4l2av1enc" => {
-                (self.element.property::<u32>("bitrate")) as i32
-            }
+            "nvv4l2h264enc" | "nvv4l2h265enc" | "nvv4l2vp8enc" | "nvv4l2vp9enc" | "rav1enc"
+            | "nvv4l2av1enc" => (self.element.property::<u32>("bitrate")) as i32,
             _ => return Err(WebRTCSinkError::BitrateNotSupported),
         };
 
@@ -1022,9 +1062,8 @@ impl VideoEncoder {
                 self.element
                     .set_property("bitrate", (bitrate / 1000) as u32);
             }
-            "nvv4l2h264enc" | "nvv4l2h265enc" | "nvv4l2vp8enc" | "nvv4l2vp9enc" | "nvv4l2av1enc" => {
-                self.element.set_property("bitrate", bitrate as u32)
-            }
+            "nvv4l2h264enc" | "nvv4l2h265enc" | "nvv4l2vp8enc" | "nvv4l2vp9enc"
+            | "nvv4l2av1enc" => self.element.set_property("bitrate", bitrate as u32),
             "rav1enc" => self.element.set_property("bitrate", bitrate),
             _ => return Err(WebRTCSinkError::BitrateNotSupported),
         }
@@ -1235,7 +1274,12 @@ impl SessionInner {
     }
 
     fn on_data_channel(&mut self, element: &super::BaseWebRTCSink, data_channel: glib::Object) {
-        gst::info!(CAT, obj = element, "Adding data channel to session for {}", self.peer_id);
+        gst::info!(
+            CAT,
+            obj = element,
+            "Adding data channel to session for {}",
+            self.peer_id
+        );
         self.data_channel = data_channel.dynamic_cast::<WebRTCDataChannel>().ok();
     }
 
@@ -1411,9 +1455,16 @@ impl SessionInner {
 
                 self.encoders.push(enc);
 
+                if let Some(congestion_controller) = self.congestion_controller.as_ref() {
+                    congestion_controller.encoders_changed(&self.encoders);
+                }
+
                 if let Some(rtpgccbwe) = self.rtpgccbwe.as_ref() {
                     let max_bitrate = self.cc_info.max_bitrate * (self.encoders.len() as u32);
                     rtpgccbwe.set_property("max-bitrate", max_bitrate);
+                    // the framerate is usually not negotiated yet, it's picked
+                    // up on the next bitrate change
+                    GccStreamParams::from_encoders(&self.encoders).apply(rtpgccbwe);
                 }
             }
         }
@@ -2616,9 +2667,42 @@ impl BaseWebRTCSink {
                                             #[strong]
                                             session_id,
                                             move |bwe, pspec| {
-                                                element.imp().set_bitrate(
-                                                    &session_id,
-                                                    bwe.property::<u32>(pspec.name()),
+                                                let bitrate = bwe.property::<u32>(pspec.name());
+                                                // No webrtcsink lock is held past this
+                                                // call, so setting rtpgccbwe properties
+                                                // and emitting the signal below can't
+                                                // deadlock against a handler calling
+                                                // back into the sink
+                                                let Some((applied, params)) =
+                                                    element.imp().set_bitrate(&session_id, bitrate)
+                                                else {
+                                                    return;
+                                                };
+                                                params.apply(bwe);
+
+                                                // Same arguments as the homegrown
+                                                // controller: the delay and loss
+                                                // controllers' targets, and the bitrate
+                                                // each encoder was given. Older
+                                                // rtpgccbwe versions don't expose the
+                                                // controllers' targets.
+                                                let controller = |name: &str| {
+                                                    if bwe.has_property(
+                                                        name,
+                                                        Some(u32::static_type()),
+                                                    ) {
+                                                        bwe.property::<u32>(name)
+                                                    } else {
+                                                        bitrate
+                                                    }
+                                                };
+                                                element.emit_by_name::<()>(
+                                                    "cc-bitrate-changed",
+                                                    &[
+                                                        &controller("delay-controller-bitrate"),
+                                                        &controller("loss-controller-bitrate"),
+                                                        &(applied.max(0) as u32),
+                                                    ],
                                                 );
                                             }
                                         ),
@@ -2661,6 +2745,83 @@ impl BaseWebRTCSink {
             }
             _ => None,
         };
+
+        // The homegrown controller paces through rtppacer, which also gives
+        // it the per-packet feedback it runs on
+        #[cfg(feature = "v1_22")]
+        let pacer = match settings.cc_info.heuristic {
+            WebRTCSinkCongestionControl::Homegrown => {
+                match gst::ElementFactory::make("rtppacer")
+                    .property("bitrate", settings.cc_info.start_bitrate.max(1))
+                    .build()
+                {
+                    Err(err) => {
+                        gst::warning!(
+                            CAT,
+                            imp = self,
+                            "The `rtppacer` element is not available, the homegrown \
+                            congestion controller runs unpaced on aggregate stats: {err:?}"
+                        );
+                        None
+                    }
+                    Ok(pacer) => {
+                        pacer.connect_closure(
+                            "packet-feedback",
+                            false,
+                            glib::closure!(
+                                #[watch]
+                                element,
+                                #[strong]
+                                session_id,
+                                move |_pacer: gst::Element, feedback: gst::Structure| {
+                                    element
+                                        .imp()
+                                        .process_packet_feedback(&session_id, &feedback);
+                                }
+                            ),
+                        );
+
+                        webrtcbin.connect_closure(
+                            "request-aux-sender",
+                            false,
+                            glib::closure!(
+                                #[strong]
+                                pacer,
+                                move |_webrtcbin: gst::Element, _transport: gst::Object| {
+                                    pacer.clone()
+                                }
+                            ),
+                        );
+
+                        // So the pacer can tell retransmissions apart
+                        webrtcbin.connect_closure(
+                            "deep-element-added",
+                            false,
+                            glib::closure!(
+                                #[strong]
+                                pacer,
+                                move |_webrtcbin: gst::Element, _bin: gst::Bin, e: gst::Element| {
+                                    if e.factory().is_some_and(|f| f.name() == "rtprtxsend") {
+                                        e.bind_property(
+                                            "payload-type-map",
+                                            &pacer,
+                                            "rtx-payload-type-map",
+                                        )
+                                        .sync_create()
+                                        .build();
+                                    }
+                                }
+                            ),
+                        );
+
+                        Some(pacer)
+                    }
+                }
+            }
+            _ => None,
+        };
+        #[cfg(not(feature = "v1_22"))]
+        let pacer: Option<gst::Element> = None;
 
         pipeline.add(&webrtcbin).unwrap();
 
@@ -2819,6 +2980,7 @@ impl BaseWebRTCSink {
                     settings.cc_info.min_bitrate,
                     settings.cc_info.max_bitrate,
                     settings.do_fec,
+                    pacer,
                 )),
                 _ => None,
             },
@@ -3114,6 +3276,20 @@ impl BaseWebRTCSink {
         Ok(())
     }
 
+    /// Runs the homegrown controller on the pacer's per-packet feedback
+    #[cfg(feature = "v1_22")]
+    fn process_packet_feedback(&self, session_id: &str, feedback: &gst::Structure) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(session) = state.sessions.get_mut(session_id) {
+            /* We need this two-step approach for split-borrowing */
+            let mut session_guard = session.0.lock().unwrap();
+            let session = session_guard.deref_mut();
+            if let Some(congestion_controller) = session.congestion_controller.as_mut() {
+                congestion_controller.packet_feedback(&self.obj(), feedback, &mut session.encoders);
+            }
+        }
+    }
+
     fn process_loss_stats(&self, session_id: &str, stats: &gst::Structure) {
         let mut state = self.state.lock().unwrap();
         if let Some(session) = state.sessions.get_mut(session_id) {
@@ -3167,8 +3343,12 @@ impl BaseWebRTCSink {
         }
     }
 
+    /// Applies rtpgccbwe's estimated `bitrate` to the session's encoders.
+    /// Returns the bitrate each encoder was given and the encoders' current
+    /// framerate and MTU, for the caller to hand back to rtpgccbwe once no
+    /// lock is held, or None if the session has no encoders.
     #[cfg(feature = "v1_22")]
-    fn set_bitrate(&self, session_id: &str, bitrate: u32) {
+    fn set_bitrate(&self, session_id: &str, bitrate: u32) -> Option<(i32, GccStreamParams)> {
         let settings = self.settings.lock().unwrap();
         let mut state = self.state.lock().unwrap();
 
@@ -3176,6 +3356,9 @@ impl BaseWebRTCSink {
             let mut session = session.0.lock().unwrap();
 
             let n_encoders = session.encoders.len();
+            if n_encoders == 0 {
+                return None;
+            }
 
             let fec_ratio = {
                 if settings.do_fec && bitrate > DO_FEC_THRESHOLD {
@@ -3204,7 +3387,17 @@ impl BaseWebRTCSink {
                         .set_property("fec-percentage", (fec_percentage as u32).min(100));
                 }
             }
+
+            // set_bitrate() may have changed the framerate through decimation;
+            // the encoders report it once it's renegotiated, which this picks
+            // up on a later call
+            return Some((
+                encoders_bitrate,
+                GccStreamParams::from_encoders(&session.encoders),
+            ));
         }
+
+        None
     }
 
     fn on_remote_description_set(&self, session_id: &str) {
@@ -3335,7 +3528,11 @@ impl BaseWebRTCSink {
     }
 
     fn handle_sdp_answer(&self, session_id: &str, desc: &gst_webrtc::WebRTCSessionDescription) {
-        gst::info!(CAT, imp = self, "Handling SDP answer for session {session_id}");
+        gst::info!(
+            CAT,
+            imp = self,
+            "Handling SDP answer for session {session_id}"
+        );
         let mut state = self.state.lock().unwrap();
 
         if let Some(session) = state.sessions.get(session_id).map(|s| s.0.clone()) {
@@ -4121,7 +4318,8 @@ impl ObjectImpl for BaseWebRTCSink {
             }
             "do-dynamic-decimation" => {
                 let mut settings = self.settings.lock().unwrap();
-                settings.do_dynamic_decimation = value.get::<bool>().expect("type checked upstream");
+                settings.do_dynamic_decimation =
+                    value.get::<bool>().expect("type checked upstream");
             }
             _ => unimplemented!(),
         }
@@ -4366,8 +4564,12 @@ impl ObjectImpl for BaseWebRTCSink {
                  * @loss-controller bitrate target
                  * @overall bitrate target
                  *
-                 * This signal is emit by the homegrown `CongestionController` when
-                 * it updates its target bitrates. All bitrates are in bps.
+                 * This signal is emitted when the congestion controller updates
+                 * its target bitrates: by the homegrown `CongestionController`,
+                 * and with `google-congestion-control` whenever rtpgccbwe's
+                 * estimate changes, in which case the overall target is the
+                 * bitrate given to each encoder (after FEC overhead). All
+                 * bitrates are in bps.
                  */
                 glib::subclass::Signal::builder("cc-bitrate-changed")
                     .param_types([u32::static_type(), u32::static_type(), u32::static_type()])
@@ -4925,9 +5127,7 @@ pub(super) mod parallel {
         /// instance, and connects to its glib signals.
         pub fn set_signaller(&self, signaller: Signallable) -> Result<(), Error> {
             let obj = self.obj();
-            let baseclass = obj
-                .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
-                .imp();
+            let baseclass = obj.upcast_ref::<crate::webrtcsink::BaseWebRTCSink>().imp();
 
             let sigobj = signaller.clone();
             self.connect_signaller(&sigobj);
@@ -4942,9 +5142,7 @@ pub(super) mod parallel {
         /// This is the primary interface between the WebRTC plugin and signalling interface.
         fn connect_signaller(&self, signaller: &Signallable) {
             let this = &*self.obj();
-            let baseclass = this
-                .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
-                .imp();
+            let baseclass = this.upcast_ref::<crate::webrtcsink::BaseWebRTCSink>().imp();
 
             let _ = baseclass.state.lock().unwrap().signaller_signals.insert(SignallerSignals {
                 error: signaller.connect_closure(
@@ -5112,9 +5310,7 @@ pub(super) mod parallel {
             peer_id: &str,
         ) -> Result<(), WebRTCSinkError> {
             let obj = self.obj();
-            let baseclass = obj
-                .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
-                .imp();
+            let baseclass = obj.upcast_ref::<crate::webrtcsink::BaseWebRTCSink>().imp();
 
             let session_id = session_id.to_string();
             {
@@ -5173,10 +5369,12 @@ pub(super) mod parallel {
                     #[strong]
                     session_id,
                     move |_webrtcbin: &gst::Element, sdp_m_line_index: u32, candidate: String| {
-                        let baseclass = obj
-                            .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
-                            .imp();
-                        baseclass.on_ice_candidate(session_id.to_string(), sdp_m_line_index, candidate);
+                        let baseclass = obj.upcast_ref::<crate::webrtcsink::BaseWebRTCSink>().imp();
+                        baseclass.on_ice_candidate(
+                            session_id.to_string(),
+                            sdp_m_line_index,
+                            candidate,
+                        );
                     }
                 ),
             );
@@ -5203,9 +5401,8 @@ pub(super) mod parallel {
                                     session_id,
                                     peer_id
                                 );
-                                let baseclass = obj
-                                    .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
-                                    .imp();
+                                let baseclass =
+                                    obj.upcast_ref::<crate::webrtcsink::BaseWebRTCSink>().imp();
                                 let _ = baseclass.remove_session(&session_id, true);
                             }
                             _ => {
@@ -5233,8 +5430,9 @@ pub(super) mod parallel {
                     #[strong]
                     session_id,
                     move |webrtcbin, _pspec| {
-                        let state = webrtcbin
-                            .property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
+                        let state = webrtcbin.property::<gst_webrtc::WebRTCICEConnectionState>(
+                            "ice-connection-state",
+                        );
 
                         match state {
                             gst_webrtc::WebRTCICEConnectionState::Failed => {
@@ -5245,9 +5443,8 @@ pub(super) mod parallel {
                                     session_id,
                                     peer_id,
                                 );
-                                let baseclass = obj
-                                    .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
-                                    .imp();
+                                let baseclass =
+                                    obj.upcast_ref::<crate::webrtcsink::BaseWebRTCSink>().imp();
                                 let _ = baseclass.remove_session(&session_id, true);
                             }
                             _ => {
@@ -5274,23 +5471,33 @@ pub(super) mod parallel {
                     #[to_owned]
                     session_id,
                     move |_webrtcbin: gst::Bin, data_channel: glib::Object| {
-                        let baseclass = obj
-                            .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
-                            .imp();
+                        let baseclass = obj.upcast_ref::<crate::webrtcsink::BaseWebRTCSink>().imp();
                         let mut state = baseclass.state.lock().unwrap();
                         let Some(session) = state.sessions.get_mut(&session_id) else {
                             gst::error!(CAT, obj = obj, "session {session_id:?} not found");
                             return;
                         };
 
-                        session.0.lock().unwrap().on_data_channel(&baseclass.obj(), data_channel);
+                        session
+                            .0
+                            .lock()
+                            .unwrap()
+                            .on_data_channel(&baseclass.obj(), data_channel);
                     }
                 ),
             );
 
-            gst::info!(CAT, obj = obj, "Setting session: {session_id} pipeline --> Ready");
+            gst::info!(
+                CAT,
+                obj = obj,
+                "Setting session: {session_id} pipeline --> Ready"
+            );
             if let Err(e) = pipeline.set_state(gst::State::Ready) {
-                return Err(WebRTCSinkError::SessionPipelineError { session_id, peer_id, details: format!("{e:?}") });
+                return Err(WebRTCSinkError::SessionPipelineError {
+                    session_id,
+                    peer_id,
+                    details: format!("{e:?}"),
+                });
             }
 
             let (signaller_cl, cc_info_cl) = {
@@ -5302,9 +5509,17 @@ pub(super) mod parallel {
             signaller_cl.emit_by_name::<()>("webrtcbin-ready", &[&peer_id, &webrtcbin]);
 
             // Now go to PLAYING
-            gst::info!(CAT, obj = obj, "Setting session: {session_id} pipeline --> Playing");
+            gst::info!(
+                CAT,
+                obj = obj,
+                "Setting session: {session_id} pipeline --> Playing"
+            );
             if let Err(e) = pipeline.set_state(gst::State::Playing) {
-                return Err(WebRTCSinkError::SessionPipelineError { session_id, peer_id, details: format!("{e:?}") });
+                return Err(WebRTCSinkError::SessionPipelineError {
+                    session_id,
+                    peer_id,
+                    details: format!("{e:?}"),
+                });
             }
 
             let session = SessionInner::new(
@@ -5319,10 +5534,9 @@ pub(super) mod parallel {
 
             {
                 let mut state = baseclass.state.lock().unwrap();
-                state.sessions.insert(
-                    session_id.clone(),
-                    Session(Arc::new(Mutex::new(session))),
-                );
+                state
+                    .sessions
+                    .insert(session_id.clone(), Session(Arc::new(Mutex::new(session))));
             }
             gst::info!(CAT, obj = obj, "Added session {session_id} to state");
 
@@ -5331,11 +5545,13 @@ pub(super) mod parallel {
 
         /// Handles the remote SDP Offer presented to the plugin (for a TextRoom connection).
         /// Returns a promise for use with `create-answer` at the call site.
-        fn handle_sdp_offer(&self, session_id: &str, offer: &gst_webrtc::WebRTCSessionDescription) -> Result<(gst::Promise, gst::Bin), WebRTCSinkError>{
+        fn handle_sdp_offer(
+            &self,
+            session_id: &str,
+            offer: &gst_webrtc::WebRTCSessionDescription,
+        ) -> Result<(gst::Promise, gst::Bin), WebRTCSinkError> {
             let obj = self.obj();
-            let baseclass = obj
-                .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
-                .imp();
+            let baseclass = obj.upcast_ref::<crate::webrtcsink::BaseWebRTCSink>().imp();
 
             let state = baseclass.state.lock().unwrap();
 
@@ -5348,8 +5564,13 @@ pub(super) mod parallel {
             let session = session.0.lock().unwrap();
             let webrtcbin = session.webrtcbin.clone();
 
-            gst::info!(CAT, obj = self.obj(), "Setting (remote) SDP offer for {session_id_str}");
-            webrtcbin.emit_by_name::<()>("set-remote-description", &[&offer, &None::<gst::Promise>]);
+            gst::info!(
+                CAT,
+                obj = self.obj(),
+                "Setting (remote) SDP offer for {session_id_str}"
+            );
+            webrtcbin
+                .emit_by_name::<()>("set-remote-description", &[&offer, &None::<gst::Promise>]);
 
             let webrtcbin = webrtcbin.downcast::<gst::Bin>().unwrap();
 
@@ -5383,16 +5604,22 @@ pub(super) mod parallel {
         }
 
         /// Handles the promise created in `handle_sdp_offer`
-        fn on_answer_created_promise(&self, promise_reply: Result<Option<&gst::StructureRef>, gst::PromiseError>, session_id: &str) {
+        fn on_answer_created_promise(
+            &self,
+            promise_reply: Result<Option<&gst::StructureRef>, gst::PromiseError>,
+            session_id: &str,
+        ) {
             let obj = self.obj();
-            let baseclass = obj
-                .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
-                .imp();
+            let baseclass = obj.upcast_ref::<crate::webrtcsink::BaseWebRTCSink>().imp();
 
             let state = baseclass.state.lock().unwrap();
             let session_id = session_id.to_string();
             if let Some(session) = state.sessions.get(&session_id) {
-                gst::info!(CAT, obj = obj, "Checking SDP Offer answer promise (session {session_id})");
+                gst::info!(
+                    CAT,
+                    obj = obj,
+                    "Checking SDP Offer answer promise (session {session_id})"
+                );
 
                 let reply = match promise_reply {
                     Ok(Some(reply)) => {
@@ -5446,9 +5673,14 @@ pub(super) mod parallel {
                 gst::info!(CAT, obj = obj, "Giving SDP Answer to WebRTCBin to set local-description (session {session_id})");
 
                 let webrtcbin = session.0.lock().unwrap().webrtcbin.clone();
-                webrtcbin.emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
+                webrtcbin
+                    .emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
 
-                gst::info!(CAT, obj = obj, "Giving SDP Answer to Signaller to send to remote (session {session_id})");
+                gst::info!(
+                    CAT,
+                    obj = obj,
+                    "Giving SDP Answer to Signaller to send to remote (session {session_id})"
+                );
 
                 let signaller = {
                     let settings = baseclass.settings.lock().unwrap();
@@ -5465,9 +5697,7 @@ pub(super) mod parallel {
             obj.set_suppressed_flags(gst::ElementFlags::SINK | gst::ElementFlags::SOURCE);
             obj.set_element_flags(gst::ElementFlags::SINK);
 
-            let baseclass = obj
-                .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
-                .imp();
+            let baseclass = obj.upcast_ref::<crate::webrtcsink::BaseWebRTCSink>().imp();
             baseclass.parent_constructed();
 
             let signaller = baseclass.settings.lock().unwrap().signaller.clone();

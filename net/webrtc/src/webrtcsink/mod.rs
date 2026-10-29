@@ -39,6 +39,7 @@ use gst::subclass::prelude::*;
 mod homegrown_cc;
 
 mod imp;
+mod packet_feedback;
 mod pad;
 
 glib::wrapper! {
