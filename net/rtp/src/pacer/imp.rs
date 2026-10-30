@@ -79,14 +79,19 @@ const SENT_LOG_MAX_AGE: Duration = Duration::from_secs(5);
 /// don't answer one are padding
 const RTX_REQUEST_MAX_AGE: Duration = Duration::from_secs(1);
 
+/// What a packet is, as far as feedback is concerned
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
+    /// Media packet, from the payloader
     Media,
+    /// Retransmission answering a NACK
     RtxRepair,
+    /// Retransmission nobody asked for, sent as bandwidth probing padding
     RtxPadding,
 }
 
 impl Kind {
+    /// Name used for the `kind` field of the feedback
     fn as_str(self) -> &'static str {
         match self {
             Kind::Media => "media",
@@ -99,72 +104,103 @@ impl Kind {
 /// What the pacer knows about a packet going through
 #[derive(Debug, Clone, Copy)]
 struct PacketInfo {
+    /// RTP payload type
     pt: u8,
+    /// RTP SSRC
     ssrc: u32,
+    /// RTP sequence number
     seqnum: u16,
+    /// RTP timestamp
     rtp_ts: u32,
+    /// RTP marker bit, set on the last packet of a frame
     marker: bool,
+    /// RTP payload size, what TWCC feedback reports as the size
     payload_len: u32,
     /// rtpsession only gives packets with a header extension a TWCC seqnum
     has_extension: bool,
+    /// Media or RTX
     kind: Kind,
-    /// Media: the frame it belongs to (Frame::uid), and whether it's the
-    /// frame's first packet
+    /// Media: the frame it belongs to (Frame::uid)
     frame: Option<u64>,
+    /// Media: whether it's the frame's first packet
     frame_start: bool,
     /// RTX: the sequence number of the packet it carries
     osn: Option<u16>,
 }
 
+/// A video frame, as seen in its packets
 #[derive(Debug, Clone)]
 struct Frame {
+    /// Unique id, increasing across streams
     uid: u64,
+    /// RTP timestamp shared by its packets
     rtp_ts: u32,
+    /// Payload bytes so far
     bytes: u64,
+    /// Packets so far
     packets: u32,
+    /// Its packets aren't flagged as delta units
     keyframe: bool,
     /// Keyframe that came before the GOP was over, i.e. on request (PLI/FIR)
     requested: bool,
     /// Not flagged as a keyframe, but sized like one
     large: bool,
+    /// Its last packet (marker bit) has been seen
     complete: bool,
+    /// When its first packet arrived
     created: Instant,
 }
 
 impl Frame {
+    /// Whether the frame is sent as a burst the queue can't absorb in one
+    /// frame interval: a keyframe or a large delta frame
     fn is_burst(&self) -> bool {
         self.keyframe || self.large
     }
 }
 
+/// Per-SSRC frame tracking
 #[derive(Debug)]
 struct MediaStream {
+    /// RTP SSRC of the stream
     ssrc: u32,
     /// The payloader flags delta units, so a buffer without the flag
     /// belongs to a keyframe
     delta_flags_seen: bool,
+    /// Frames since the last keyframe, None before the first one
     frames_since_keyframe: Option<u64>,
+    /// Moving average of the delta frame size, to spot large frames
     avg_delta_frame_bytes: Option<f64>,
     /// The frame being received
     current: Option<u64>,
 }
 
+/// A packet waiting in the pacer
 struct Queued {
+    /// The RTP packet
     buffer: gst::Buffer,
+    /// What's known about it, None if it isn't RTP
     info: Option<PacketInfo>,
+    /// When it entered the queue, for its deadline
     enqueued: Instant,
 }
 
 /// What the pacer pushes downstream
 enum Output {
+    /// An RTP packet
     Buffer(gst::Buffer),
+    /// A serialized event that was queued behind packets
     Event(gst::Event),
 }
 
+/// A packet that left the pacer with a TWCC extension
 #[derive(Debug)]
 struct Sent {
+    /// Position in the order rtpsession numbers packets
     index: u64,
+    /// What the pacer knew about it
     info: PacketInfo,
+    /// When it left the pacer
     at: Instant,
 }
 
@@ -173,14 +209,21 @@ struct Sent {
 struct Feedback {
     /// Extended TWCC seqnum
     seqnum: i64,
+    /// Send time on rtpsession's clock
     local_ts: u64,
+    /// Arrival time on the receiver's clock, None if lost
     remote_ts: Option<u64>,
+    /// Payload type rtpsession saw, to check alignment
     pt: u8,
+    /// RTP payload size, to check alignment
     size: u32,
+    /// Reported lost by the receiver
     lost: bool,
 }
 
 impl Feedback {
+    /// Parses one packet of an `RTPTWCCPackets` event, with its TWCC seqnum.
+    /// None for packets rtpsession has no send time for.
     fn from_structure(s: &gst::StructureRef) -> Option<(u16, Self)> {
         // rtpsession leaves these at NONE for packets it lost track of
         let local_ts = s.get::<u64>("local-ts").ok().filter(|ts| *ts != u64::MAX)?;
@@ -206,42 +249,60 @@ impl Feedback {
 }
 
 struct State {
+    /// Target bitrate from the congestion controller, bit/sec
     bitrate: u32,
+    /// Pacing rate as a multiple of the bitrate
     pacing_factor: f64,
+    /// Encoder frame rate, sets the queue times
     framerate: f64,
+    /// Encoder keyframe interval in frames, 0 if unknown
     gop_size: u32,
+    /// rtprtxsend's payload-type-map, as set
     rtx_pt_map: Option<gst::Structure>,
+    /// RTX payload types from rtx_pt_map
     rtx_pts: Vec<u8>,
 
+    /// RTX packets, sent before any media
     rtx_queue: VecDeque<Queued>,
+    /// Media packets and anything that isn't RTX
     media_queue: VecDeque<Queued>,
     /// Serialized events, each with the number of media packets queued
     /// before it, so they go out in order with the media
     events: VecDeque<(u64, gst::Event)>,
+    /// Media packets queued since start, to place events
     media_enqueued: u64,
+    /// Media packets sent since start, to release events
     media_dequeued: u64,
+    /// Bytes in both queues
     queued_bytes: u64,
     /// Bits sent ahead of (negative) or behind (positive) the budget
     budget_offset: f64,
+    /// When the budget was last updated
     last_push: Option<Instant>,
     /// Sending faster than the pacing rate to keep within the queue time
     speeding_up: bool,
 
+    /// Media streams by SSRC
     streams: Vec<MediaStream>,
     /// Ordered by uid
     frames: VecDeque<Frame>,
+    /// uid for the next new frame
     next_frame_uid: u64,
     /// Sequence numbers rtpsession asked rtprtxsend to retransmit
     rtx_requests: VecDeque<(u16, Instant)>,
 
     /// Packets that got a TWCC seqnum, in the order rtpsession numbered them
     sent: VecDeque<Sent>,
+    /// Index for the next packet added to `sent`
     next_index: u64,
     /// Extended TWCC seqnum minus index in `sent`, once lined up
     offset: Option<i64>,
+    /// Highest extended TWCC seqnum seen in feedback
     twcc_extended_seqnum: Option<i64>,
 
+    /// Clock entry the srcpad task waits on between ticks
     clock_entry: Option<gst::SingleShotClockId>,
+    /// Last flow return from downstream, returned by the chain function
     flow_return: Result<gst::FlowSuccess, gst::FlowError>,
 }
 
@@ -278,6 +339,7 @@ impl Default for State {
 }
 
 impl State {
+    /// Rate in bit/sec the queue drains at when it's within its queue time
     fn pacing_rate(&self) -> f64 {
         self.bitrate as f64 * self.pacing_factor
     }
@@ -297,6 +359,8 @@ impl State {
         Duration::from_secs_f64(secs).max(self.frame_queue_time())
     }
 
+    /// Takes rtprtxsend's `payload-type-map` (media PT -> RTX PT) to tell
+    /// RTX packets apart
     fn set_rtx_pt_map(&mut self, map: Option<gst::Structure>) {
         self.rtx_pts = map
             .iter()
@@ -312,6 +376,7 @@ impl State {
         self.rtx_pt_map = map;
     }
 
+    /// Frame by uid, if it's still tracked
     fn frame(&self, uid: u64) -> Option<&Frame> {
         self.frames
             .binary_search_by_key(&uid, |f| f.uid)
@@ -319,6 +384,7 @@ impl State {
             .map(|i| &self.frames[i])
     }
 
+    /// Mutable frame by uid, if it's still tracked
     fn frame_mut(&mut self, uid: u64) -> Option<&mut Frame> {
         self.frames
             .binary_search_by_key(&uid, |f| f.uid)
@@ -326,6 +392,9 @@ impl State {
             .map(|i| &mut self.frames[i])
     }
 
+    /// Reads what the pacer needs from an RTP packet: RTX packets are
+    /// repairs if a retransmission was requested for their original sequence number (OSN), padding
+    /// otherwise; media packets are added to their frame. None if it isn't RTP.
     fn classify(
         &mut self,
         element: &super::Pacer,
@@ -520,6 +589,8 @@ impl State {
         (uid, frame_start)
     }
 
+    /// Marks a frame complete once its last packet is in, and folds delta
+    /// frames into the stream's average frame size
     fn finish_frame(&mut self, element: &super::Pacer, stream_idx: usize, uid: u64) {
         let avg_delta_frame_bytes = self.streams[stream_idx].avg_delta_frame_bytes;
         let Some(frame) = self.frame_mut(uid) else {
@@ -560,6 +631,8 @@ impl State {
         }
     }
 
+    /// Queues a packet: RTX ahead of media, so repairs aren't stuck behind
+    /// a keyframe
     fn enqueue(&mut self, element: &super::Pacer, buffer: gst::Buffer, now: Instant) {
         let info = self.classify(element, &buffer, now);
         if info.is_none() {
@@ -584,6 +657,7 @@ impl State {
         }
     }
 
+    /// Queues a serialized event behind the media packets queued so far
     fn enqueue_event(&mut self, event: gst::Event) {
         self.events.push_back((self.media_enqueued, event));
     }
@@ -676,9 +750,9 @@ impl State {
         }
 
         let mut budget = self.budget_offset + rate * elapsed.as_secs_f64();
-        let mut list = Vec::new();
+        let mut output = Vec::new();
         loop {
-            self.release_events(&mut list);
+            self.release_events(&mut output);
             if budget <= 0. {
                 break;
             }
@@ -731,26 +805,28 @@ impl State {
                 self.next_index += 1;
             }
 
-            list.push(Output::Buffer(queued.buffer));
+            output.push(Output::Buffer(queued.buffer));
         }
 
         // Budget left over while the queue is empty doesn't carry beyond a
         // tick's worth, or the next frame would go out as a burst
         self.budget_offset = budget.min(rate * TICK.as_secs_f64());
 
-        if !list.is_empty() {
+        if !output.is_empty() {
             gst::trace!(
                 CAT,
                 obj = element,
                 "Sending {} items at {rate:.0} bit/s, {} bytes still queued",
-                list.len(),
+                output.len(),
                 self.queued_bytes,
             );
         }
 
-        list
+        output
     }
 
+    /// Forgets sent packets, frames and retransmission requests too old to
+    /// matter for feedback or classification
     fn prune(&mut self, now: Instant) {
         while self
             .sent
@@ -776,6 +852,8 @@ impl State {
         }
     }
 
+    /// Extends a 16-bit TWCC seqnum to 64 bits, relative to the highest
+    /// seen so far
     fn extend_seqnum(&mut self, seqnum: u16) -> i64 {
         let extended = match self.twcc_extended_seqnum {
             None => i64::from(seqnum),
@@ -788,6 +866,7 @@ impl State {
         extended
     }
 
+    /// Sent packet with the given index in the sent log
     fn sent_at(&self, index: i64) -> Option<&Sent> {
         let front = self.sent.front()?.index as i64;
         let pos = usize::try_from(index - front).ok()?;
@@ -954,13 +1033,18 @@ impl State {
 }
 
 pub struct Pacer {
+    /// Everything the chain function, srcpad task and events share
     state: Mutex<State>,
 
+    /// Pushes paced packets, receives TWCC and retransmission events
     srcpad: gst::Pad,
+    /// Receives RTP packets from rtprtxsend
     sinkpad: gst::Pad,
 }
 
 impl Pacer {
+    /// Pushes dequeued buffers and events downstream, in order, stopping at
+    /// the first flow error
     fn push_list(&self, list: Vec<Output>) -> Result<gst::FlowSuccess, gst::FlowError> {
         let mut res = Ok(gst::FlowSuccess::Ok);
         for output in list {
@@ -980,6 +1064,7 @@ impl Pacer {
         res
     }
 
+    /// Starts the srcpad task that dequeues every TICK on the system clock
     fn start_task(&self) -> Result<(), glib::BoolError> {
         let weak_pacer = self.obj().downgrade();
         let weak_pad = self.srcpad.downgrade();
@@ -1041,6 +1126,8 @@ impl Pacer {
         })
     }
 
+    /// Starts the task on activation; stops it and drops the queue on
+    /// deactivation
     fn src_activatemode(&self, mode: gst::PadMode, active: bool) -> Result<(), gst::LoggableError> {
         if mode != gst::PadMode::Push {
             return Err(gst::loggable_error!(CAT, "Unsupported pad mode {mode:?}"));
@@ -1061,6 +1148,8 @@ impl Pacer {
         Ok(())
     }
 
+    /// Flushes the queue on flush-start and keeps serialized events in order
+    /// with the queued packets
     fn sink_event(&self, pad: &gst::Pad, event: gst::Event) -> bool {
         match event.type_() {
             gst::EventType::FlushStart => {
@@ -1089,6 +1178,8 @@ impl Pacer {
         gst::Pad::event_default(pad, Some(&*self.obj()), event)
     }
 
+    /// Turns TWCC feedback into `packet-feedback` signals and records
+    /// retransmission requests, then forwards upstream
     fn src_event(&self, pad: &gst::Pad, event: gst::Event) -> bool {
         if let Some(structure) = event.structure() {
             match structure.name().as_str() {
@@ -1385,6 +1476,7 @@ mod tests {
         INIT.call_once(|| gst::init().unwrap());
     }
 
+    /// A pacer element, for log context
     fn element() -> super::super::Pacer {
         init();
         glib::Object::new()
@@ -1568,6 +1660,7 @@ mod tests {
         ));
     }
 
+    /// Logs packets of `sizes` as sent, with TWCC extensions
     fn sent(state: &mut State, sizes: &[u32]) {
         let now = Instant::now();
         for size in sizes {
@@ -1592,6 +1685,7 @@ mod tests {
         }
     }
 
+    /// TWCC feedback for packets of `sizes`, starting at TWCC seqnum `first`
     fn feedback(first: i64, sizes: &[u32]) -> Vec<Feedback> {
         sizes
             .iter()

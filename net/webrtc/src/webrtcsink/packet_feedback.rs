@@ -31,6 +31,7 @@ static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     )
 });
 
+/// Nanoseconds to milliseconds, for logs
 fn ms(ns: impl Into<f64>) -> f64 {
     ns.into() / 1e6
 }
@@ -98,10 +99,12 @@ impl FeedbackPacket {
         }
     }
 
+    /// Whether the packet is part of a regular delta frame
     fn is_delta(&self) -> bool {
         self.kind == PacketKind::Media && !self.is_burst()
     }
 
+    /// Parses one `RTPPacerPacket`. None if it lacks a send time or size.
     fn from_structure(s: &gst::StructureRef) -> Option<Self> {
         let kind = match s.get::<&str>("kind").ok()? {
             "media" => PacketKind::Media,
@@ -184,6 +187,7 @@ struct Drain {
 }
 
 impl Drain {
+    /// Starts a drain at the first packet of a burst
     fn new(p: &FeedbackPacket, arrival: i64) -> Self {
         Self {
             start_arrival: arrival,
@@ -195,6 +199,7 @@ impl Drain {
         }
     }
 
+    /// Adds a packet that arrived while the drain is ongoing
     fn add(&mut self, p: &FeedbackPacket, arrival: i64) {
         self.last_arrival = self.last_arrival.max(arrival);
         self.last_send = self.last_send.max(p.send_ns);
@@ -217,6 +222,7 @@ impl Drain {
         capacity.map(|capacity| self.bytes as f64 * 8. / capacity * 1e9)
     }
 
+    /// Logs how long the drain has taken against how long it should
     fn log_overrun(&self, arrival: i64, capacity: Option<f64>, what: &str) {
         gst::debug!(
             CAT,
@@ -237,6 +243,7 @@ struct BaseDelay {
 }
 
 impl BaseDelay {
+    /// Adds a one-way delay sample and ages out buckets older than the window
     fn update(&mut self, send_ns: i64, owd: i64) {
         match self.buckets.back_mut() {
             Some((start, min)) if send_ns - *start < BASE_DELAY_BUCKET_NS => *min = (*min).min(owd),
@@ -251,6 +258,7 @@ impl BaseDelay {
         }
     }
 
+    /// Smallest one-way delay in the window
     fn get(&self) -> Option<i64> {
         self.buckets.iter().map(|(_, min)| *min).min()
     }
@@ -267,6 +275,7 @@ pub(crate) struct PacketDetector {
 }
 
 impl PacketDetector {
+    /// Current bottleneck capacity estimate, in bit/sec
     #[cfg(test)]
     pub fn capacity(&self) -> Option<f64> {
         self.capacity
@@ -386,6 +395,9 @@ impl PacketDetector {
         signals
     }
 
+    /// Estimates capacity from how a finished drain spread out on arrival.
+    /// If the bottleneck spread it (arrival spread clearly over send spread)
+    /// the sample is averaged in; if the pacer did, it's only a lower bound.
     fn measure_capacity(&mut self, drain: &Drain) {
         let arrival_spread = drain.last_arrival - drain.start_arrival;
         let send_spread = drain.last_send - drain.first_send;
@@ -452,6 +464,7 @@ mod tests {
     }
 
     impl Link {
+        /// Arrival time of a packet sent at `send_ns`
         fn send(&mut self, send_ns: i64, size: u32) -> i64 {
             let start = self.free_at.max(send_ns);
             self.free_at = start + (f64::from(size) * 8. / self.capacity * 1e9) as i64;
@@ -459,6 +472,7 @@ mod tests {
         }
     }
 
+    /// `n` packets of one frame, sent at `pace_bps` through `link`
     fn packets(
         link: &mut Link,
         start_ns: i64,
