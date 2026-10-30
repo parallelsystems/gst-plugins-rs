@@ -85,6 +85,30 @@ const MAX_THRESHOLD: Duration = Duration::milliseconds(600);
 // From 5.5 ""Close" is defined as three standard deviations around this average"
 const STANDARD_DEVIATION_CLOSE_NUM: f64 = 3.;
 
+// Lower bound on the standard deviation used for "close", as a fraction of
+// the average, so an average built from one or two decreases isn't nearly
+// zero wide
+const MIN_STANDARD_DEVIATION_RATIO: f64 = 0.05;
+
+// Time without a delay decrease after which the average is discarded and
+// the delay controller increases multiplicatively again. The receive rate
+// follows the target, so once the average is set it tends to stay "close"
+// and keep the controller in additive mode long after capacity has moved.
+const CONGESTION_WINDOW_EXPIRY: Duration = Duration::seconds(5);
+
+// Additive increase (5.5), as a rate: about one expected packet per
+// response time, at least MIN_ADDITIVE_INCREASE_BPS_PER_SEC, scaled to the
+// time since the last increase (at most MAX_INCREASE_INTERVAL)
+const MIN_ADDITIVE_INCREASE_BPS_PER_SEC: f64 = 10_000.;
+const RESPONSE_TIME_BASE: Duration = Duration::milliseconds(100);
+const MAX_INCREASE_INTERVAL: Duration = Duration::seconds(1);
+
+// How far above the applied target the loss controller's target may climb.
+// It increases on every update without loss, and when it isn't the lower of
+// the two targets nothing else holds it back: left alone it runs away to
+// max-bitrate, and a loss episode then takes several cuts to bite.
+const LOSS_TARGET_HEADROOM: f64 = 1.1;
+
 // Minimal duration between 2 updates on the lost based rate controller
 const LOSS_UPDATE_INTERVAL: Duration = Duration::milliseconds(200);
 const LOSS_DECREASE_THRESHOLD: f64 = 0.1;
@@ -95,6 +119,15 @@ const LOSS_INCREASE_FACTOR: f64 = 1.05;
 const DELAY_UPDATE_INTERVAL: Duration = Duration::milliseconds(100);
 
 const ROUND_TRIP_TIME_WINDOW_SIZE: usize = 100;
+
+// Framerate and MTU assumed for the expected packet size in the additive
+// increase (5.5), until the "framerate" and "mtu" properties say otherwise
+const DEFAULT_FRAMERATE: f64 = 30.;
+const DEFAULT_MTU: u32 = 1200;
+
+// The pacer holds at most this much data, or one frame interval if that is
+// longer, before sending whatever is left at once
+const MIN_PACING_QUEUE: Duration = Duration::milliseconds(30);
 
 const fn ts2dur(t: gst::ClockTime) -> Duration {
     Duration::nanoseconds(t.nseconds() as i64)
@@ -683,8 +716,9 @@ impl ExponentialMovingAverage {
 
     fn estimate_is_close(&self, value: Bitrate) -> bool {
         self.average.is_some_and(|avg| {
-            ((avg - STANDARD_DEVIATION_CLOSE_NUM * self.standard_dev)
-                ..(avg + STANDARD_DEVIATION_CLOSE_NUM * self.standard_dev))
+            let standard_dev = f64::max(self.standard_dev, MIN_STANDARD_DEVIATION_RATIO * avg);
+            ((avg - STANDARD_DEVIATION_CLOSE_NUM * standard_dev)
+                ..(avg + STANDARD_DEVIATION_CLOSE_NUM * standard_dev))
                 .contains(&(value as f64))
         })
     }
@@ -732,6 +766,11 @@ struct State {
 
     flow_return: Result<gst::FlowSuccess, gst::FlowError>,
     last_push: Instant,
+
+    /// Framerate and MTU of the stream, for the expected packet size and
+    /// the pacer's queue
+    framerate: f64,
+    mtu: u32,
 }
 
 impl Default for State {
@@ -756,6 +795,8 @@ impl Default for State {
             clock_entry: None,
             last_push: Instant::now(),
             budget_offset: 0,
+            framerate: DEFAULT_FRAMERATE,
+            mtu: DEFAULT_MTU,
         }
     }
 }
@@ -779,8 +820,12 @@ impl State {
         let mut list_size = 0;
         let mut list = BufferList::new();
 
-        // Leak the bucket so it can hold at most 30ms of data
-        let maximum_remaining_bits = 30. * self.estimated_bitrate as f64 / 1000.;
+        // Leak the bucket so it holds at most MIN_PACING_QUEUE of data, or one
+        // frame interval if that is longer: at low framerates a frame takes
+        // longer than 30 ms to send at the estimated bitrate, and leaking
+        // after 30 ms would send the rest of it as a burst
+        let max_queue_secs = f64::max(MIN_PACING_QUEUE.as_seconds_f64(), 1. / self.framerate);
+        let maximum_remaining_bits = max_queue_secs * self.estimated_bitrate as f64;
         let mut leaked = false;
         while (budget > 0 || remaining > maximum_remaining_bits) && !self.buffers.is_empty() {
             let buf = self.buffers.pop_back().unwrap();
@@ -838,26 +883,41 @@ impl State {
         }
 
         self.last_increase_on_delay = Some(now);
+        if self.ema.average.is_some()
+            && now - self.last_decrease_on_delay > CONGESTION_WINDOW_EXPIRY
+        {
+            gst::debug!(
+                CAT,
+                obj = bwe,
+                "No delay decrease for {CONGESTION_WINDOW_EXPIRY}, discarding the average"
+            );
+            self.ema = Default::default();
+        }
         if self.ema.estimate_is_close(effective_bitrate) {
-            let bits_per_frame = target_bitrate / 30.;
-            let packets_per_frame = f64::ceil(bits_per_frame / (1200. * 8.));
+            let bits_per_frame = target_bitrate / self.framerate;
+            let packets_per_frame =
+                f64::max(1., f64::ceil(bits_per_frame / (self.mtu as f64 * 8.)));
             let avg_packet_size_bits = bits_per_frame / packets_per_frame;
 
-            let rtt_ms = self.detector.rtt().whole_milliseconds() as f64;
-            let response_time_ms = 100. + rtt_ms;
-            let alpha = 0.5 * f64::min(time_since_last_update_ms / response_time_ms, 1.0);
+            let response_time_secs =
+                RESPONSE_TIME_BASE.as_seconds_f64() + self.detector.rtt().as_seconds_f64();
+            let rate_bps_per_sec = f64::max(
+                MIN_ADDITIVE_INCREASE_BPS_PER_SEC,
+                avg_packet_size_bits / response_time_secs,
+            );
+            let interval_secs = f64::min(
+                time_since_last_update_ms / 1000.,
+                MAX_INCREASE_INTERVAL.as_seconds_f64(),
+            );
             let threshold_on_effective_bitrate = 1.5 * effective_bitrate as f64;
-            let increase = f64::max(
-                1000.0f64,
-                f64::min(
-                    alpha * avg_packet_size_bits,
-                    // Stuffing should ensure that the effective bitrate is not
-                    // < target bitrate, still, make sure to always increase
-                    // the bitrate by a minimum amount of 160.bits
-                    f64::max(
-                        threshold_on_effective_bitrate - self.target_bitrate_on_delay as f64,
-                        160.0,
-                    ),
+            let increase = f64::min(
+                rate_bps_per_sec * interval_secs,
+                // Stuffing should ensure that the effective bitrate is not
+                // < target bitrate, still, make sure to always increase
+                // the bitrate by a minimum amount of 160.bits
+                f64::max(
+                    threshold_on_effective_bitrate - self.target_bitrate_on_delay as f64,
+                    160.0,
                 ),
             );
 
@@ -985,11 +1045,16 @@ impl State {
             self.last_control_op = BandwidthEstimationOp::Increase("Low loss".into());
             self.last_increase_on_loss = now;
 
-            self.set_bitrate(
-                bwe,
-                (self.target_bitrate_on_loss as f64 * LOSS_INCREASE_FACTOR) as Bitrate,
-                ControllerType::Loss,
-            )
+            // Kept within LOSS_TARGET_HEADROOM of the applied target. This can
+            // also pull the loss target down, when the delay controller has
+            // lowered the applied target since.
+            let applied = Bitrate::min(self.target_bitrate_on_delay, self.target_bitrate_on_loss);
+            let increased = f64::min(
+                self.target_bitrate_on_loss as f64 * LOSS_INCREASE_FACTOR,
+                applied as f64 * LOSS_TARGET_HEADROOM,
+            );
+
+            self.set_bitrate(bwe, increased as Bitrate, ControllerType::Loss)
         } else {
             false
         }
@@ -1320,6 +1385,32 @@ impl ObjectImpl for BandwidthEstimator {
                     .blurb("How to calculate the delay estimate that will be compared against the dynamic delay threshold.")
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecDouble::builder("framerate")
+                    .nick("Framerate")
+                    .blurb("Framerate of the stream being sent, used for the expected packet size of the additive increase and to let the pacer hold a whole frame")
+                    .minimum(1.)
+                    .maximum(1000.)
+                    .default_value(DEFAULT_FRAMERATE)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecUInt::builder("mtu")
+                    .nick("MTU")
+                    .blurb("Maximum RTP packet size of the stream being sent, used for the expected packet size of the additive increase")
+                    .minimum(1)
+                    .maximum(u16::MAX as u32)
+                    .default_value(DEFAULT_MTU)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecUInt64::builder("rtt")
+                    .nick("Round-trip time")
+                    .blurb("Round-trip time estimated from the transport-wide feedback, in nanoseconds")
+                    .flags(glib::ParamFlags::READABLE)
+                    .build(),
+                glib::ParamSpecUInt::builder("effective-bitrate")
+                    .nick("Effective Bitrate")
+                    .blurb("Bitrate the receiver got over the last second, from the transport-wide feedback, in bit/sec")
+                    .flags(glib::ParamFlags::READABLE)
+                    .build(),
             ]
         });
 
@@ -1347,6 +1438,14 @@ impl ObjectImpl for BandwidthEstimator {
                 let mut state = self.state.lock().unwrap();
                 state.estimator = value.get().unwrap();
                 state.detector.estimator_impl = state.estimator.to_impl()
+            }
+            "framerate" => {
+                let mut state = self.state.lock().unwrap();
+                state.framerate = value.get::<f64>().expect("type checked upstream");
+            }
+            "mtu" => {
+                let mut state = self.state.lock().unwrap();
+                state.mtu = value.get::<u32>().expect("type checked upstream");
             }
             _ => unimplemented!(),
         }
@@ -1377,6 +1476,31 @@ impl ObjectImpl for BandwidthEstimator {
             "delay-controller-bitrate" => {
                 let state = self.state.lock().unwrap();
                 state.target_bitrate_on_delay.to_value()
+            }
+            "framerate" => {
+                let state = self.state.lock().unwrap();
+                state.framerate.to_value()
+            }
+            "mtu" => {
+                let state = self.state.lock().unwrap();
+                state.mtu.to_value()
+            }
+            "rtt" => {
+                let state = self.state.lock().unwrap();
+                // 0 until the first feedback
+                let rtt = if state.detector.rtts.is_empty() {
+                    0
+                } else {
+                    state.detector.rtt().whole_nanoseconds().max(0) as u64
+                };
+                rtt.to_value()
+            }
+            "effective-bitrate" => {
+                let state = self.state.lock().unwrap();
+                // a window holding a single packet spans no time and reads as
+                // u32::MAX; that is no measurement yet
+                let bitrate = state.detector.effective_bitrate();
+                (if bitrate == u32::MAX { 0 } else { bitrate }).to_value()
             }
             _ => unimplemented!(),
         }
