@@ -44,18 +44,18 @@ const BASE_DELAY_BUCKET_NS: i64 = 1_000_000_000;
 /// Smoothing factor of the queuing delay, per delta frame
 const QUEUE_DELAY_ALPHA: f64 = 0.25;
 
-/// Packets arriving at most this far apart (or twice their transmission
-/// time at the estimated capacity, if longer) were queued back to back
-const BACK_TO_BACK_MIN_NS: i64 = 1_000_000;
+/// A packet whose one-way delay is this much above that of the burst's
+/// first packet was queued behind the burst
+const QUEUED_BEHIND_NS: i64 = 5_000_000;
 
-/// A burst may take this many times the time its bytes need at the
-/// estimated capacity to drain...
+/// The delay a burst builds up may be this many times what its bytes
+/// explain at the estimated capacity...
 const DRAIN_MARGIN: f64 = 1.5;
 /// ... plus this, before the queue behind it counts as congestion
 const DRAIN_SLACK_NS: f64 = 20_000_000.;
-/// Without a capacity estimate, a burst draining for longer than this is
-/// congestion
-const MAX_DRAIN_NS: i64 = 2_000_000_000;
+/// Without a capacity estimate, a burst building up more delay than this
+/// is congestion
+const MAX_DRAIN_NS: f64 = 2_000_000_000.;
 
 /// A drain spanning at least this many bytes and this long measures the
 /// capacity
@@ -206,30 +206,43 @@ impl Drain {
         self.bytes += u64::from(p.size);
     }
 
-    /// Whether, at `arrival`, the queue behind the burst has been draining
-    /// for longer than the burst explains
-    fn overdue(&self, arrival: i64, capacity: Option<f64>) -> bool {
-        let elapsed = arrival - self.start_arrival;
-        match self.expected_ns(capacity) {
-            Some(expected) => elapsed as f64 > expected * DRAIN_MARGIN + DRAIN_SLACK_NS,
-            None => elapsed > MAX_DRAIN_NS,
+    /// How much more one-way delay a packet sent at `send` and arriving at
+    /// `arrival` had than the burst's first packet: the queue the burst
+    /// built up. Zero if the pacer sent it no faster than the link carries.
+    fn delay_growth(&self, send: i64, arrival: i64) -> i64 {
+        (arrival - self.start_arrival) - (send - self.first_send)
+    }
+
+    /// Whether a packet sent at `send` and arriving at `arrival` saw more
+    /// queue than the burst explains
+    fn overdue(&self, send: i64, arrival: i64, capacity: Option<f64>) -> bool {
+        let growth = self.delay_growth(send, arrival) as f64;
+        match self.expected_growth_ns(send, capacity) {
+            Some(expected) => growth > expected * DRAIN_MARGIN + DRAIN_SLACK_NS,
+            None => growth > MAX_DRAIN_NS,
         }
     }
 
-    /// How long the bytes of the burst and of what queued behind it take
-    /// at `capacity`
-    fn expected_ns(&self, capacity: Option<f64>) -> Option<f64> {
-        capacity.map(|capacity| self.bytes as f64 * 8. / capacity * 1e9)
+    /// The queue left at `send` by sending the drain's bytes faster than
+    /// `capacity`: what they need at `capacity` minus how long they took
+    /// to send
+    fn expected_growth_ns(&self, send: i64, capacity: Option<f64>) -> Option<f64> {
+        capacity.map(|capacity| {
+            (self.bytes as f64 * 8. / capacity * 1e9 - (send - self.first_send) as f64).max(0.)
+        })
     }
 
-    /// Logs how long the drain has taken against how long it should
-    fn log_overrun(&self, arrival: i64, capacity: Option<f64>, what: &str) {
+    /// Logs the delay the drain built up against what it should have
+    fn log_overrun(&self, send: i64, arrival: i64, capacity: Option<f64>, what: &str) {
         gst::debug!(
             CAT,
-            "{what}: draining for {:.1} ms, its {} bytes need {:?} ms at capacity {:?}",
+            "{what}: {:.1} ms more delay after draining for {:.1} ms, its {} bytes sent over \
+             {:.1} ms explain {:?} ms at capacity {:?}",
+            ms(self.delay_growth(send, arrival) as f64),
             ms((arrival - self.start_arrival) as f64),
             self.bytes,
-            self.expected_ns(capacity).map(ms),
+            ms((send - self.first_send) as f64),
+            self.expected_growth_ns(send, capacity).map(ms),
             capacity,
         );
     }
@@ -269,7 +282,6 @@ pub(crate) struct PacketDetector {
     base_delay: BaseDelay,
     capacity: Option<f64>,
     drain: Option<Drain>,
-    last_arrival: Option<i64>,
     last_delta_frame: Option<(u32, u32)>,
     queue_delay_ns: Option<f64>,
 }
@@ -309,8 +321,6 @@ impl PacketDetector {
             };
             let owd = arrival - p.send_ns;
             self.base_delay.update(p.send_ns, owd);
-            let gap = self.last_arrival.map(|last| arrival - last);
-            self.last_arrival = Some(self.last_arrival.map_or(arrival, |last| last.max(arrival)));
 
             if p.is_burst() {
                 match self.drain.as_mut() {
@@ -330,21 +340,20 @@ impl PacketDetector {
             }
 
             if let Some(drain) = self.drain.as_mut() {
-                let transmission_ns = self.capacity.map_or(0, |capacity| {
-                    (f64::from(p.size) * 8. / capacity * 1e9) as i64
-                });
-                let back_to_back =
-                    gap.is_some_and(|gap| gap <= BACK_TO_BACK_MIN_NS.max(2 * transmission_ns));
-                let overdue = drain.overdue(arrival, self.capacity);
+                // A paced burst on a link that keeps up with it leaves no
+                // queue: the delta frames after it end the drain right away
+                let queued_behind = drain.delay_growth(p.send_ns, arrival) > QUEUED_BEHIND_NS;
+                let overdue = drain.overdue(p.send_ns, arrival, self.capacity);
 
-                if back_to_back && !overdue {
+                if queued_behind && !overdue {
                     // Queued behind the burst: says nothing about the network
                     drain.add(p, arrival);
                     continue;
                 }
 
-                if back_to_back {
+                if queued_behind {
                     drain.log_overrun(
+                        p.send_ns,
                         arrival,
                         self.capacity,
                         "delta frames still queued behind a burst",
@@ -381,9 +390,14 @@ impl PacketDetector {
         }
 
         // A burst still draining long after it should be through
-        if let (Some(drain), Some(last_arrival)) = (self.drain.as_ref(), self.last_arrival) {
-            if drain.overdue(last_arrival, self.capacity) {
-                drain.log_overrun(last_arrival, self.capacity, "burst still draining");
+        if let Some(drain) = self.drain.as_ref() {
+            if drain.overdue(drain.last_send, drain.last_arrival, self.capacity) {
+                drain.log_overrun(
+                    drain.last_send,
+                    drain.last_arrival,
+                    self.capacity,
+                    "burst still draining",
+                );
                 signals.drain_overrun = true;
             }
         }
@@ -412,8 +426,16 @@ impl PacketDetector {
             return;
         }
 
-        let sample = bytes as f64 * 8. / arrival_spread as f64 * 1e9;
         let queue_limited = arrival_spread as f64 > QUEUE_LIMITED_SPREAD * send_spread as f64;
+        // Packets the pacer sent in one go can arrive closer together than
+        // the link's sustained rate: for a lower bound, go by the slower of
+        // sending and arriving
+        let spread = if queue_limited {
+            arrival_spread
+        } else {
+            arrival_spread.max(send_spread)
+        };
+        let sample = bytes as f64 * 8. / spread as f64 * 1e9;
         let previous = self.capacity;
         self.capacity = Some(match self.capacity {
             // The bottleneck spread the burst out: that's its rate
@@ -531,6 +553,54 @@ mod tests {
         );
         let capacity = last.capacity.unwrap();
         assert!((capacity - 8e6).abs() < 0.3e6, "{capacity}");
+    }
+
+    #[test]
+    fn paced_keyframes_on_a_fast_link_are_not_congestion() {
+        // What the Jetson did on an idle LAN: 10 fps, keyframes every 25
+        // frames, and frames sized like one in between. The pacer sends a
+        // few packets per 5 ms tick, faster at first, then spreads bursts
+        // over hundreds of ms once the bitrate is lower.
+        let mut link = Link {
+            capacity: 1e9,
+            free_at: 0,
+            extra_ns: 0,
+        };
+        let mut detector = PacketDetector::default();
+        // The pacer's next tick: frames wait behind the burst before them
+        let mut tick = 0;
+        for i in 0..250u32 {
+            tick = tick.max(i64::from(i) * 100 * MS);
+            let (n, burst) = match i % 25 {
+                0 => (110, true),
+                12 => (80, true),
+                _ => (20, false),
+            };
+            // 15 Mbps catching up at first, then 1.9 Mbps
+            let per_tick = match (burst, i < 50) {
+                (true, true) => 8,
+                _ => 1,
+            };
+            let p: Vec<_> = (0..n)
+                .map(|j| {
+                    let send_ns = tick;
+                    if (j + 1) % per_tick == 0 || j + 1 == n {
+                        tick += 5 * MS;
+                    }
+                    FeedbackPacket {
+                        send_ns,
+                        arrival_ns: Some(link.send(send_ns, 1200)),
+                        size: 1200,
+                        kind: PacketKind::Media,
+                        keyframe: burst,
+                        large_frame: false,
+                        frame: Some((1, i)),
+                    }
+                })
+                .collect();
+            let signals = detector.update(&p);
+            assert!(!signals.drain_overrun, "overrun at frame {i}");
+        }
     }
 
     #[test]

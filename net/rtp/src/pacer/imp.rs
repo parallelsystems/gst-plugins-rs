@@ -181,8 +181,10 @@ struct Queued {
     buffer: gst::Buffer,
     /// What's known about it, None if it isn't RTP
     info: Option<PacketInfo>,
-    /// When it entered the queue, for its deadline
+    /// When it entered the queue
     enqueued: Instant,
+    /// When it must have left the pacer, set when it's queued
+    deadline: Instant,
 }
 
 /// What the pacer pushes downstream
@@ -644,10 +646,35 @@ impl State {
         }
         self.queued_bytes += buffer.size() as u64;
 
+        // Packets queued behind a keyframe or large frame get its longer
+        // queue time, and keep it once the frame has left: shortening it
+        // then would leave them overdue and send them as a burst
+        let burst_frame = info
+            .and_then(|info| info.frame)
+            .filter(|uid| self.frame(*uid).is_some_and(Frame::is_burst));
+        let queue_time = if burst_frame.is_some() || self.burst_queued() {
+            self.keyframe_queue_time()
+        } else {
+            self.frame_queue_time()
+        };
+        if let Some(uid) = burst_frame {
+            // A large frame is only found out a few packets in
+            let keyframe_queue_time = self.keyframe_queue_time();
+            for queued in self
+                .media_queue
+                .iter_mut()
+                .rev()
+                .take_while(|q| q.info.and_then(|info| info.frame) == Some(uid))
+            {
+                queued.deadline = queued.deadline.max(queued.enqueued + keyframe_queue_time);
+            }
+        }
+
         let queued = Queued {
             buffer,
             info,
             enqueued: now,
+            deadline: now + queue_time,
         };
         if info.is_some_and(|info| info.kind != Kind::Media) {
             self.rtx_queue.push_back(queued);
@@ -708,20 +735,13 @@ impl State {
         let elapsed = self.last_push.map_or(Duration::ZERO, |t| now - t);
         self.last_push = Some(now);
 
-        let queue_time = if self.burst_queued() {
-            self.keyframe_queue_time()
-        } else {
-            self.frame_queue_time()
-        };
-        // Speed up just enough for every packet to leave within queue_time
-        // of being queued, rather than send what doesn't fit as a burst
+        // Speed up just enough for every packet to leave by its deadline,
+        // rather than send what doesn't fit as a burst
         let mut rate = self.pacing_rate();
         let mut ahead_bits = 0.;
         for queued in self.rtx_queue.iter().chain(self.media_queue.iter()) {
             ahead_bits += queued.buffer.size() as f64 * 8.;
-            let left = (queued.enqueued + queue_time)
-                .saturating_duration_since(now)
-                .max(TICK);
+            let left = queued.deadline.saturating_duration_since(now).max(TICK);
             rate = rate.max(ahead_bits / left.as_secs_f64());
         }
 
@@ -733,10 +753,10 @@ impl State {
                     CAT,
                     obj = element,
                     "Speeding up to {rate:.0} bit/s (pacing rate {:.0}) to send {} queued bytes \
-                     within {queue_time:?} (keyframe queued: {})",
+                     by their deadlines (keyframe queued: {})",
                     self.pacing_rate(),
                     self.queued_bytes,
-                    queue_time > self.frame_queue_time(),
+                    self.burst_queued(),
                 );
             } else {
                 gst::debug!(
@@ -1516,11 +1536,24 @@ mod tests {
 
     /// Queues a frame of `packets` packets of `size` bytes
     fn frame(state: &mut State, seqnum: &mut u16, ts: u32, packets: u32, size: u32, delta: bool) {
+        frame_at(state, seqnum, ts, packets, size, delta, Instant::now());
+    }
+
+    /// Same, queued at `at`
+    fn frame_at(
+        state: &mut State,
+        seqnum: &mut u16,
+        ts: u32,
+        packets: u32,
+        size: u32,
+        delta: bool,
+        at: Instant,
+    ) {
         for i in 0..packets {
             state.enqueue(
                 &element(),
                 rtp_buffer(96, *seqnum, ts, size, i + 1 == packets, delta, None),
-                Instant::now(),
+                at,
             );
             *seqnum += 1;
         }
@@ -1638,6 +1671,47 @@ mod tests {
         }
         // and didn't go out at once
         assert!(t - start > Duration::from_millis(250));
+    }
+
+    #[test]
+    fn delta_frames_behind_a_keyframe_are_not_burst_out_after_it() {
+        init();
+        let mut state = State {
+            bitrate: 1_000_000,
+            pacing_factor: 1.,
+            ..Default::default()
+        };
+        let mut seqnum = 0;
+        let start = Instant::now();
+        state.last_push = Some(start);
+        // 60 kB keyframe: 480 ms at 1 Mbps, must be through in 300 ms
+        frame_at(&mut state, &mut seqnum, 0, 50, 1200, false, start);
+
+        let mut t = start;
+        let mut sent = 0;
+        while sent < 50 + 2 * 5 {
+            t += TICK;
+            // Delta frames coming in while the keyframe is still queued
+            for (i, at) in [100, 200].into_iter().enumerate() {
+                if t - start == Duration::from_millis(at) {
+                    frame_at(
+                        &mut state,
+                        &mut seqnum,
+                        9000 * (i as u32 + 1),
+                        5,
+                        1000,
+                        true,
+                        t,
+                    );
+                }
+            }
+            let n = state.dequeue(&element(), t).len();
+            // Keyframe pace is 1.6 Mbps, a packet per tick: no catching up
+            // on overdue delta frames once it's out
+            assert!(n <= 2, "{n} packets sent at once after {:?}", t - start);
+            sent += n;
+            assert!(t - start < Duration::from_millis(520));
+        }
     }
 
     #[test]
