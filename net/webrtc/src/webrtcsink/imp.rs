@@ -4574,6 +4574,20 @@ impl ObjectImpl for BaseWebRTCSink {
                 glib::subclass::Signal::builder("cc-bitrate-changed")
                     .param_types([u32::static_type(), u32::static_type(), u32::static_type()])
                     .build(),
+                /**
+                 * GstBaseWebRTCSink::cc-detector-changed:
+                 * @capacity: measured bottleneck capacity, in bps. 
+                 * @capacity-lower-bound: rate the link recently carried at least, in bps
+                 * @queue-delay: smoothed queuing delay of delta frames, in ns
+                 *
+                 * This signal is emitted by the homegrown `CongestionController`
+                 * running on the pacer's per-packet feedback, whenever one of its
+                 * detector's signals changes. A value is 0 while it is unknown:
+                 * not measured yet, or stale.
+                 */
+                glib::subclass::Signal::builder("cc-detector-changed")
+                    .param_types([u32::static_type(), u32::static_type(), u64::static_type()])
+                    .build(),
             ]
         });
 

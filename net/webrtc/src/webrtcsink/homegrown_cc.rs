@@ -137,8 +137,12 @@ const QUEUE_DELAY_OVERUSE: Duration = Duration::from_millis(40);
 const QUEUE_DELAY_NORMAL: Duration = Duration::from_millis(15);
 
 /// On congestion the packet-level delay controller cuts to at most this
-/// fraction of the capacity measured from bursts draining
+/// fraction of the capacity measured from bursts the bottleneck spread out,
+/// and increases stop there
 const CAPACITY_TARGET_RATIO: f64 = 0.9;
+
+/// Above this fraction of the measured capacity, increases are additive
+const CAPACITY_ADDITIVE_RATIO: f64 = 0.8;
 
 /// Delta frame packets the loss controller waits for, across feedbacks,
 /// before deciding on their loss
@@ -146,6 +150,16 @@ const MIN_LOSS_PACKETS: usize = 10;
 
 /// Smoothing factor of the retransmission rate, per feedback
 const RTX_RATE_ALPHA: f64 = 0.2;
+
+/// Whether the queue grew enough since the last cut, when it was
+/// `at_cut`, for another one: at least doubled, and by QUEUE_DELAY_OVERUSE.
+/// A cut leaves the queue to drain at whatever the link has to spare, which
+/// can take a while; a delay that doesn't respond to cuts at all (the path
+/// getting longer, a queue someone else's traffic keeps up) isn't one cuts
+/// can drain.
+fn queue_grew_since_cut(queue_delay: Duration, at_cut: Duration) -> bool {
+    queue_delay > at_cut + at_cut.max(QUEUE_DELAY_OVERUSE)
+}
 
 /// Seconds since `last`, bounded by MAX_INCREASE_INTERVAL, 0 on the first update
 fn increase_interval_secs(last: Option<Instant>, now: Instant) -> f64 {
@@ -159,6 +173,19 @@ fn increase_interval_secs(last: Option<Instant>, now: Instant) -> f64 {
 /// Multiplicative increase at MULTIPLICATIVE_INCREASE_PER_SEC over `interval_secs`
 fn multiplicative_increase(interval_secs: f64) -> IncreaseType {
     IncreaseType::Multiplicative(MULTIPLICATIVE_INCREASE_PER_SEC.powf(interval_secs))
+}
+
+/// `increase` from `current`, cut short so it doesn't go past `ceiling`
+fn limit_increase(increase: IncreaseType, current: f64, ceiling: f64) -> IncreaseType {
+    match increase {
+        IncreaseType::Additive(value) => IncreaseType::Additive(value.min(ceiling - current)),
+        IncreaseType::Multiplicative(factor) => {
+            IncreaseType::Multiplicative(factor.min(ceiling / current))
+        }
+        IncreaseType::FastRecovery(factor) => {
+            IncreaseType::FastRecovery(factor.min(ceiling / current))
+        }
+    }
 }
 
 /// A run of decreases from one controller close together in time, and the
@@ -397,6 +424,9 @@ pub struct CongestionController {
     last_loss_update_time: Option<std::time::Instant>,
     /// Time of the last delay decrease, used to expire the congestion window
     last_delay_decrease: Option<std::time::Instant>,
+    /// Queuing delay at the last packet-level delay decrease, until the
+    /// queue is back to normal
+    queue_at_cut: Option<Duration>,
     /// Congestion episodes and fast recovery, per controller
     delay_episode: CongestionEpisode,
     loss_episode: CongestionEpisode,
@@ -413,6 +443,9 @@ pub struct CongestionController {
     /// Whether the controller ran on per-packet feedback last time it
     /// decided, to log when it switches
     on_packet_feedback: bool,
+    /// Detector signals last emitted with `cc-detector-changed`: capacity
+    /// and its lower bound in bps, queuing delay in ns
+    emitted_detector: Option<(u32, u32, u64)>,
     /// Delta frame packets reported, and lost, since the loss controller's
     /// last decision
     delta_packets: usize,
@@ -446,6 +479,7 @@ impl CongestionController {
             last_update_time: None,
             last_loss_update_time: None,
             last_delay_decrease: None,
+            queue_at_cut: None,
             delay_episode: CongestionEpisode::default(),
             loss_episode: CongestionEpisode::default(),
             delay_signals: DelaySignals::default(),
@@ -453,6 +487,7 @@ impl CongestionController {
             detector: PacketDetector::default(),
             last_packet_feedback: None,
             on_packet_feedback: false,
+            emitted_detector: None,
             delta_packets: 0,
             delta_lost: 0,
             rtx_rate: 0.,
@@ -569,6 +604,7 @@ impl CongestionController {
                 interval_secs,
                 rtt,
                 delay_factor <= RECOVERY_MAX_DELAY_FACTOR,
+                None,
                 encoders,
             )
         }
@@ -576,8 +612,65 @@ impl CongestionController {
 
     /// The delay controller's increase once its signals are clear.
     /// `recovered` tells whether they say the link is back after a
-    /// congestion episode, for fast recovery.
+    /// congestion episode, for fast recovery. With a `capacity`, increases
+    /// turn additive at CAPACITY_ADDITIVE_RATIO of it and stop at
+    /// CAPACITY_TARGET_RATIO: the link is known, no need to find it by
+    /// overflowing its buffer.
+    #[allow(clippy::too_many_arguments)]
     fn delay_increase(
+        &mut self,
+        element: &super::BaseWebRTCSink,
+        now: Instant,
+        interval_secs: f64,
+        rtt: f64,
+        recovered: bool,
+        capacity: Option<f64>,
+        encoders: &[VideoEncoder],
+    ) -> CongestionControlOp {
+        let Some(capacity) = capacity else {
+            return self.window_increase(element, now, interval_secs, rtt, recovered, encoders);
+        };
+
+        let current = self.target_bitrate_on_delay as f64;
+        let ceiling = CAPACITY_TARGET_RATIO * capacity;
+        if current >= ceiling {
+            gst::trace!(
+                CAT,
+                obj = element,
+                "consumer {}: delay target {:.0} at {} of capacity {:.0}, holding",
+                self.peer_id,
+                current,
+                CAPACITY_TARGET_RATIO,
+                capacity,
+            );
+            return CongestionControlOp::Hold;
+        }
+
+        let near_capacity = current >= CAPACITY_ADDITIVE_RATIO * capacity;
+        let increase =
+            match self.window_increase(element, now, interval_secs, rtt, recovered, encoders) {
+                CongestionControlOp::Increase(IncreaseType::Multiplicative(_)) if near_capacity => {
+                    gst::trace!(
+                        CAT,
+                        obj = element,
+                        "consumer {}: delay target {:.0} near capacity {:.0}",
+                        self.peer_id,
+                        current,
+                        capacity,
+                    );
+                    let target_bitrate = f64::min(current, self.target_bitrate_on_loss as f64);
+                    self.additive_increase(element, target_bitrate, interval_secs, rtt, encoders)
+                }
+                CongestionControlOp::Increase(increase) => increase,
+                op => return op,
+            };
+
+        CongestionControlOp::Increase(limit_increase(increase, current, ceiling))
+    }
+
+    /// The increase as the last congestion window (and fast recovery) says:
+    /// multiplicative outside it, additive inside it
+    fn window_increase(
         &mut self,
         element: &super::BaseWebRTCSink,
         now: Instant,
@@ -660,29 +753,15 @@ impl CongestionController {
                 self.bitrate_ema.take();
                 multiplicative_increase(interval_secs)
             } else {
-                // About one packet per response time, as in gcc section 5.5
-                // and libwebrtc. The response time is how long the network
-                // takes to show the effect of an increase, not how long the
-                // detector averages for, so it doesn't include the delay
-                // signal window.
-                let response_time_secs = RESPONSE_TIME_BASE.as_secs_f64() + rtt;
-                let avg_packet_size_bits =
-                    self.avg_packet_size_bits(element, target_bitrate, encoders);
-                let rate_bps_per_sec = f64::max(
-                    MIN_ADDITIVE_INCREASE_BPS_PER_SEC,
-                    avg_packet_size_bits / response_time_secs,
-                );
-
                 gst::trace!(
                     CAT,
                     obj = element,
-                    "consumer {}: still in last congestion window, increasing by {:.0} bps/s",
+                    "consumer {}: still in last congestion window",
                     self.peer_id,
-                    rate_bps_per_sec,
                 );
 
                 /* Additive increase */
-                IncreaseType::Additive(rate_bps_per_sec * interval_secs)
+                self.additive_increase(element, target_bitrate, interval_secs, rtt, encoders)
             }
         } else {
             /* Multiplicative increase */
@@ -694,6 +773,36 @@ impl CongestionController {
             );
             multiplicative_increase(interval_secs)
         })
+    }
+
+    /// About one packet per response time, as in gcc section 5.5 and
+    /// libwebrtc. The response time is how long the network takes to show
+    /// the effect of an increase, not how long the detector averages for, so
+    /// it doesn't include the delay signal window.
+    fn additive_increase(
+        &self,
+        element: &super::BaseWebRTCSink,
+        target_bitrate: f64,
+        interval_secs: f64,
+        rtt: f64,
+        encoders: &[VideoEncoder],
+    ) -> IncreaseType {
+        let response_time_secs = RESPONSE_TIME_BASE.as_secs_f64() + rtt;
+        let avg_packet_size_bits = self.avg_packet_size_bits(element, target_bitrate, encoders);
+        let rate_bps_per_sec = f64::max(
+            MIN_ADDITIVE_INCREASE_BPS_PER_SEC,
+            avg_packet_size_bits / response_time_secs,
+        );
+
+        gst::trace!(
+            CAT,
+            obj = element,
+            "consumer {}: increasing additively by {:.0} bps/s",
+            self.peer_id,
+            rate_bps_per_sec,
+        );
+
+        IncreaseType::Additive(rate_bps_per_sec * interval_secs)
     }
 
     /// Expected average RTP packet size in bits, averaged over the encoders.
@@ -932,6 +1041,7 @@ impl CongestionController {
         self.last_packet_feedback = Some(now);
 
         let signals = self.detector.update(&packets);
+        self.emit_detector_changed(element, &signals);
         if signals.send_span_ns > 0 {
             let rtx_rate = signals.rtx_bits as f64 / (signals.send_span_ns as f64 / 1e9);
             self.rtx_rate += RTX_RATE_ALPHA * (rtx_rate - self.rtx_rate);
@@ -940,13 +1050,14 @@ impl CongestionController {
         gst::trace!(
             CAT,
             obj = element,
-            "consumer {}: queue delay {:?} over {} delta frames, drain overrun {}, capacity {:?}, \
-             delta loss {}/{}, burst loss {}/{}, rtx rate {:.0}",
+            "consumer {}: queue delay {:?} over {} delta frames, drain overrun {}, capacity {:?} \
+             (lower bound {:?}), delta loss {}/{}, burst loss {}/{}, rtx rate {:.0}",
             self.peer_id,
             signals.queue_delay,
             signals.delay_samples,
             signals.drain_overrun,
             signals.capacity,
+            signals.capacity_lower_bound,
             signals.delta_lost,
             signals.delta_packets,
             signals.burst_lost,
@@ -988,6 +1099,28 @@ impl CongestionController {
             let op = self.loss_op(element, loss_percentage);
             self.apply_control_op(element, encoders, op, ControllerType::Loss);
         }
+    }
+
+    /// Emits `cc-detector-changed` if the capacity, its lower bound or the
+    /// queuing delay changed since last time, with 0 for unknown values
+    fn emit_detector_changed(&mut self, element: &super::BaseWebRTCSink, signals: &Signals) {
+        let bps = |rate: Option<f64>| rate.map_or(0, |rate| rate.round() as u32);
+        let detector = (
+            bps(signals.capacity),
+            bps(signals.capacity_lower_bound),
+            signals
+                .queue_delay
+                .map_or(0, |delay| delay.as_nanos() as u64),
+        );
+        if self.emitted_detector == Some(detector) {
+            return;
+        }
+        self.emitted_detector = Some(detector);
+
+        element.emit_by_name::<()>(
+            "cc-detector-changed",
+            &[&detector.0, &detector.1, &detector.2],
+        );
     }
 
     /// The delay controller on the per-packet signals: the queue standing at
@@ -1040,6 +1173,25 @@ impl CongestionController {
             }
 
             let current = self.target_bitrate_on_delay as f64;
+            let above_capacity = signals
+                .capacity
+                .is_some_and(|capacity| current > CAPACITY_TARGET_RATIO * capacity);
+            if let Some(at_cut) = self.queue_at_cut {
+                if !above_capacity && !queue_grew_since_cut(queue_delay, at_cut) {
+                    gst::debug!(
+                        CAT,
+                        obj = element,
+                        "consumer {}: congested (queue delay {:?}, drain overrun {}) but the \
+                         queue hasn't grown since the last decrease ({:?}), holding",
+                        self.peer_id,
+                        queue_delay,
+                        signals.drain_overrun,
+                        at_cut,
+                    );
+                    return CongestionControlOp::Hold;
+                }
+            }
+
             let mut factor = DELAY_DECREASE_FACTOR;
             if let Some(capacity) = signals.capacity {
                 factor = factor.min(CAPACITY_TARGET_RATIO * capacity / current);
@@ -1060,7 +1212,7 @@ impl CongestionController {
                 factor,
             );
 
-            self.detector.reset_queue_delay();
+            self.queue_at_cut = Some(queue_delay);
             return CongestionControlOp::Decrease {
                 factor,
                 reason: if signals.drain_overrun {
@@ -1071,6 +1223,9 @@ impl CongestionController {
             };
         }
 
+        if queue_delay <= QUEUE_DELAY_NORMAL {
+            self.queue_at_cut = None;
+        }
         if settling || queue_delay > QUEUE_DELAY_NORMAL {
             gst::trace!(
                 CAT,
@@ -1084,7 +1239,19 @@ impl CongestionController {
             return CongestionControlOp::Hold;
         }
 
-        self.delay_increase(element, now, interval_secs, self.rtt, true, encoders)
+        // A bound above the measurement says the link got faster since
+        let capacity = signals
+            .capacity
+            .map(|capacity| capacity.max(signals.capacity_lower_bound.unwrap_or(0.)));
+        self.delay_increase(
+            element,
+            now,
+            interval_secs,
+            self.rtt,
+            true,
+            capacity,
+            encoders,
+        )
     }
 
     /// Tells the pacer the framerate and GOP length the encoders run at
@@ -1312,6 +1479,41 @@ mod tests {
             Some((IncreaseType::FastRecovery(f), _)) => Some(f),
             _ => None,
         }
+    }
+
+    #[test]
+    fn cuts_again_only_on_a_growing_queue() {
+        let ms = Duration::from_millis;
+        // no-netem1: the delay stayed at 40-90 ms through a 6x cut
+        assert!(!queue_grew_since_cut(ms(89), ms(47)));
+        assert!(queue_grew_since_cut(ms(95), ms(47)));
+        // a queue growing on a link that dropped doubles quickly
+        assert!(!queue_grew_since_cut(ms(1500), ms(800)));
+        assert!(queue_grew_since_cut(ms(1700), ms(800)));
+    }
+
+    #[test]
+    fn increases_stop_at_the_ceiling() {
+        // ladder_degraded at 2:25: 1.8 Mbps against a ceiling of 0.9 x 1.85
+        let ceiling = CAPACITY_TARGET_RATIO * 1.85e6;
+        let IncreaseType::Multiplicative(f) =
+            limit_increase(IncreaseType::Multiplicative(1.08), 1.6e6, ceiling)
+        else {
+            panic!()
+        };
+        assert!((1.6e6 * f - ceiling).abs() < 1.);
+        let IncreaseType::Additive(v) =
+            limit_increase(IncreaseType::Additive(45_000.), 1.6e6, ceiling)
+        else {
+            panic!()
+        };
+        assert!((v - 45_000.).abs() < 1e-9);
+        let IncreaseType::FastRecovery(f) =
+            limit_increase(IncreaseType::FastRecovery(1.25), 1.5e6, ceiling)
+        else {
+            panic!()
+        };
+        assert!((1.5e6 * f - ceiling).abs() < 1.);
     }
 
     #[test]

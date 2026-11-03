@@ -56,15 +56,41 @@ const DRAIN_SLACK_NS: f64 = 20_000_000.;
 /// Without a capacity estimate, a burst building up more delay than this
 /// is congestion
 const MAX_DRAIN_NS: f64 = 2_000_000_000.;
+/// Delta frames queued this much longer than the burst's own packets: the
+/// queue grows on delta frames alone, sent faster than the link carries,
+/// and the drain would never end
+const DELTA_QUEUE_GROWTH_NS: i64 = 40_000_000;
 
 /// A drain spanning at least this many bytes and this long measures the
 /// capacity
 const MIN_CAPACITY_SAMPLE_BYTES: u64 = 10_000;
 const MIN_CAPACITY_SAMPLE_NS: i64 = 2_000_000;
-/// The drain was limited by the bottleneck, not by the pacer, when it
-/// arrived this much more spread out than it was sent
-const QUEUE_LIMITED_SPREAD: f64 = 1.1;
-const CAPACITY_ALPHA: f64 = 0.3;
+/// The drain was limited by the bottleneck, not by the pacer, when the
+/// queue it built reached this fraction of how long it took to arrive...
+const QUEUE_LIMITED_GROWTH: f64 = 0.2;
+/// ... and at least this, above the receive-side jitter
+const MIN_QUEUE_LIMITED_GROWTH_NS: i64 = 20_000_000;
+/// The measured capacity is the median of this many recent samples from
+/// drains the bottleneck spread out, so one jittered sample doesn't move it
+const CAPACITY_SAMPLES: usize = 5;
+/// A sample this far below the measured capacity replaces it outright: the
+/// link got slower, and waiting for the median to follow would take a few
+/// more bursts
+const CAPACITY_DROP_RATIO: f64 = 0.8;
+/// Without a new sample for this long, the measured capacity is stale
+const CAPACITY_MAX_AGE_NS: i64 = 30_000_000_000;
+/// A drain the pacer spread out only shows the link carried that rate at
+/// that moment: it's a lower bound for this long
+const LOWER_BOUND_MAX_AGE_NS: i64 = 10_000_000_000;
+/// Packets that arrived over at least this long measure the delivery rate...
+const DELIVERY_WINDOW_NS: i64 = 500_000_000;
+/// ... which is the capacity if they all queued at least this much, so the
+/// link never went idle...
+const MIN_STANDING_QUEUE_NS: i64 = 20_000_000;
+/// ... and the link spread them out over at least this many times as long as
+/// they took to send. A path's delay going up queues every packet just the
+/// same, but then they arrive as fast as they were sent.
+const DELIVERY_SPREAD_RATIO: f64 = 1.15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PacketKind {
@@ -164,8 +190,12 @@ pub(crate) struct Signals {
     pub delay_samples: usize,
     /// A burst took longer to drain than its own bytes explain
     pub drain_overrun: bool,
-    /// Bottleneck capacity measured from bursts draining, bit/sec
+    /// Bottleneck capacity measured from bursts it spread out, bit/sec.
+    /// None until measured, or once stale.
     pub capacity: Option<f64>,
+    /// Rate the link recently carried at least, from bursts the pacer
+    /// spread out, bit/sec
+    pub capacity_lower_bound: Option<f64>,
     pub delta_packets: usize,
     pub delta_lost: usize,
     pub burst_packets: usize,
@@ -184,6 +214,10 @@ struct Drain {
     last_send: i64,
     first_size: u32,
     bytes: u64,
+    /// Most queue the drain built up, ns
+    max_growth: i64,
+    /// Most queue the burst's own packets saw, ns
+    burst_max_growth: i64,
 }
 
 impl Drain {
@@ -196,6 +230,8 @@ impl Drain {
             last_send: p.send_ns,
             first_size: p.size,
             bytes: u64::from(p.size),
+            max_growth: 0,
+            burst_max_growth: 0,
         }
     }
 
@@ -204,6 +240,11 @@ impl Drain {
         self.last_arrival = self.last_arrival.max(arrival);
         self.last_send = self.last_send.max(p.send_ns);
         self.bytes += u64::from(p.size);
+        let growth = self.delay_growth(p.send_ns, arrival);
+        self.max_growth = self.max_growth.max(growth);
+        if p.is_burst() {
+            self.burst_max_growth = self.burst_max_growth.max(growth);
+        }
     }
 
     /// How much more one-way delay a packet sent at `send` and arriving at
@@ -223,6 +264,14 @@ impl Drain {
         }
     }
 
+    /// Whether a delta frame packet sent at `send` and arriving at `arrival`
+    /// queued well beyond what the burst's packets did. Behind a burst sent
+    /// above a link that keeps up with the delta frames, the queue peaks with
+    /// the burst's last packet and shrinks from there.
+    fn queue_growing(&self, send: i64, arrival: i64) -> bool {
+        self.delay_growth(send, arrival) > self.burst_max_growth + DELTA_QUEUE_GROWTH_NS
+    }
+
     /// The queue left at `send` by sending the drain's bytes faster than
     /// `capacity`: what they need at `capacity` minus how long they took
     /// to send
@@ -236,9 +285,10 @@ impl Drain {
     fn log_overrun(&self, send: i64, arrival: i64, capacity: Option<f64>, what: &str) {
         gst::debug!(
             CAT,
-            "{what}: {:.1} ms more delay after draining for {:.1} ms, its {} bytes sent over \
-             {:.1} ms explain {:?} ms at capacity {:?}",
+            "{what}: {:.1} ms more delay ({:.1} ms for the burst) after draining for {:.1} ms, \
+             its {} bytes sent over {:.1} ms explain {:?} ms at capacity {:?}",
             ms(self.delay_growth(send, arrival) as f64),
+            ms(self.burst_max_growth as f64),
             ms((arrival - self.start_arrival) as f64),
             self.bytes,
             ms((send - self.first_send) as f64),
@@ -277,20 +327,163 @@ impl BaseDelay {
     }
 }
 
+/// A packet that arrived, for the delivery rate
+#[derive(Debug, Clone, Copy)]
+struct Delivered {
+    send: i64,
+    arrival: i64,
+    size: u32,
+    /// Its one-way delay over the base delay, ns
+    queue: i64,
+}
+
+/// Packets that arrived over the last DELIVERY_WINDOW_NS, in feedback order
+#[derive(Debug, Default)]
+struct DeliveryWindow {
+    packets: VecDeque<Delivered>,
+}
+
+impl DeliveryWindow {
+    /// Adds a packet, ageing out those not needed to span a window before it
+    fn push(&mut self, packet: Delivered) {
+        self.packets.push_back(packet);
+        while self
+            .packets
+            .get(1)
+            .is_some_and(|p| packet.arrival - p.arrival >= DELIVERY_WINDOW_NS)
+        {
+            self.packets.pop_front();
+        }
+    }
+
+    /// The rate the window's packets arrived at, bit/sec, if it is the
+    /// capacity: they arrived over a whole window, all queued, and the link
+    /// spread them out. Starts a new window when it is.
+    fn take_capacity(&mut self) -> Option<f64> {
+        let first_arrival = self.packets.iter().map(|p| p.arrival).min()?;
+        let last_arrival = self.packets.iter().map(|p| p.arrival).max()?;
+        let first_send = self.packets.iter().map(|p| p.send).min()?;
+        let last_send = self.packets.iter().map(|p| p.send).max()?;
+        let arrival_spread = last_arrival - first_arrival;
+        let send_spread = last_send - first_send;
+        let min_queue = self.packets.iter().map(|p| p.queue).min()?;
+        if arrival_spread < DELIVERY_WINDOW_NS
+            || min_queue < MIN_STANDING_QUEUE_NS
+            || (arrival_spread as f64) < DELIVERY_SPREAD_RATIO * send_spread as f64
+        {
+            return None;
+        }
+
+        // The first packet's bytes went out before the window started
+        let bytes: u64 = self.packets.iter().skip(1).map(|p| u64::from(p.size)).sum();
+        let rate = bytes as f64 * 8. / arrival_spread as f64 * 1e9;
+        gst::debug!(
+            CAT,
+            "delivery rate under a standing queue: {} packets, {} bytes arrived over {:.1} ms, \
+             sent over {:.1} ms, queuing at least {:.1} ms: {:.0} bit/s",
+            self.packets.len(),
+            bytes,
+            ms(arrival_spread as f64),
+            ms(send_spread as f64),
+            ms(min_queue as f64),
+            rate,
+        );
+        self.packets.clear();
+        Some(rate)
+    }
+}
+
+/// The bottleneck's rate, measured from drains it spread out, kept apart
+/// from what drains the pacer spread out show the link can at least carry.
+/// Times are send times, in ns.
+#[derive(Debug, Default)]
+struct Capacity {
+    /// Recent bottleneck-limited samples, bit/sec, oldest first
+    samples: VecDeque<f64>,
+    /// When the last of them was taken
+    measured_at: Option<i64>,
+    /// Highest recent pacer-limited sample, bit/sec, and when it was taken
+    lower_bound: Option<(f64, i64)>,
+}
+
+impl Capacity {
+    /// Adds a sample from a drain the bottleneck spread out. Returns whether
+    /// it replaced the estimate, being well below it or the estimate stale.
+    fn add_measurement(&mut self, sample: f64, at: i64) -> bool {
+        let replace = self
+            .measured(at)
+            .map_or(true, |capacity| sample < CAPACITY_DROP_RATIO * capacity);
+        if replace {
+            self.samples.clear();
+        }
+        self.samples.push_back(sample);
+        while self.samples.len() > CAPACITY_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.measured_at = Some(at);
+        replace
+    }
+
+    /// Adds a sample from a drain the pacer spread out
+    fn add_lower_bound(&mut self, sample: f64, at: i64) {
+        if self.lower_bound(at).map_or(true, |bound| sample >= bound) {
+            self.lower_bound = Some((sample, at));
+        }
+    }
+
+    /// Median of the recent samples, None if there are none or they're stale
+    fn measured(&self, now: i64) -> Option<f64> {
+        if now - self.measured_at? > CAPACITY_MAX_AGE_NS {
+            return None;
+        }
+        let mut sorted: Vec<f64> = self.samples.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        let mid = sorted.len() / 2;
+        Some(if sorted.len() % 2 == 0 {
+            (sorted[mid - 1] + sorted[mid]) / 2.
+        } else {
+            sorted[mid]
+        })
+    }
+
+    /// The lower bound, None once it has aged out
+    fn lower_bound(&self, now: i64) -> Option<f64> {
+        self.lower_bound
+            .filter(|(_, at)| now - at <= LOWER_BOUND_MAX_AGE_NS)
+            .map(|(bound, _)| bound)
+    }
+
+    /// What drains are judged against: the measured capacity, or failing
+    /// that the lower bound, which only makes the judgement more lenient
+    fn reference(&self, now: i64) -> Option<f64> {
+        self.measured(now).or_else(|| self.lower_bound(now))
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct PacketDetector {
     base_delay: BaseDelay,
-    capacity: Option<f64>,
+    capacity: Capacity,
+    /// Latest send time seen, ns
+    now_ns: i64,
     drain: Option<Drain>,
+    /// Recent packets, to measure the capacity from while a queue stands
+    delivered: DeliveryWindow,
     last_delta_frame: Option<(u32, u32)>,
     queue_delay_ns: Option<f64>,
 }
 
 impl PacketDetector {
-    /// Current bottleneck capacity estimate, in bit/sec
+    /// Measured bottleneck capacity, in bit/sec
     #[cfg(test)]
     pub fn capacity(&self) -> Option<f64> {
-        self.capacity
+        self.capacity.measured(self.now_ns)
+    }
+
+    /// Rate the link recently carried at least, in bit/sec
+    #[cfg(test)]
+    pub fn capacity_lower_bound(&self) -> Option<f64> {
+        self.capacity.lower_bound(self.now_ns)
     }
 
     /// Processes the packets of one feedback, in TWCC order
@@ -302,6 +495,7 @@ impl PacketDetector {
             packets.iter().map(|p| p.send_ns).max(),
         ) {
             signals.send_span_ns = last - first;
+            self.now_ns = self.now_ns.max(last);
         }
 
         for p in packets {
@@ -321,6 +515,14 @@ impl PacketDetector {
             };
             let owd = arrival - p.send_ns;
             self.base_delay.update(p.send_ns, owd);
+            if let Some(base) = self.base_delay.get() {
+                self.delivered.push(Delivered {
+                    send: p.send_ns,
+                    arrival,
+                    size: p.size,
+                    queue: owd - base,
+                });
+            }
 
             if p.is_burst() {
                 match self.drain.as_mut() {
@@ -343,9 +545,11 @@ impl PacketDetector {
                 // A paced burst on a link that keeps up with it leaves no
                 // queue: the delta frames after it end the drain right away
                 let queued_behind = drain.delay_growth(p.send_ns, arrival) > QUEUED_BEHIND_NS;
-                let overdue = drain.overdue(p.send_ns, arrival, self.capacity);
+                let capacity = self.capacity.reference(p.send_ns);
+                let overdue = drain.overdue(p.send_ns, arrival, capacity);
+                let growing = drain.queue_growing(p.send_ns, arrival);
 
-                if queued_behind && !overdue {
+                if queued_behind && !overdue && !growing {
                     // Queued behind the burst: says nothing about the network
                     drain.add(p, arrival);
                     continue;
@@ -355,8 +559,12 @@ impl PacketDetector {
                     drain.log_overrun(
                         p.send_ns,
                         arrival,
-                        self.capacity,
-                        "delta frames still queued behind a burst",
+                        capacity,
+                        if growing {
+                            "delta frames queued longer than the burst before them"
+                        } else {
+                            "delta frames still queued behind a burst"
+                        },
                     );
                     signals.drain_overrun = true;
                 }
@@ -391,27 +599,45 @@ impl PacketDetector {
 
         // A burst still draining long after it should be through
         if let Some(drain) = self.drain.as_ref() {
-            if drain.overdue(drain.last_send, drain.last_arrival, self.capacity) {
+            let capacity = self.capacity.reference(drain.last_send);
+            if drain.overdue(drain.last_send, drain.last_arrival, capacity) {
                 drain.log_overrun(
                     drain.last_send,
                     drain.last_arrival,
-                    self.capacity,
+                    capacity,
                     "burst still draining",
                 );
                 signals.drain_overrun = true;
             }
         }
 
+        if let Some(rate) = self.delivered.take_capacity() {
+            let previous = self.capacity.measured(self.now_ns);
+            let replaced = self.capacity.add_measurement(rate, self.now_ns);
+            gst::debug!(
+                CAT,
+                "capacity {:?} -> {:?}{} from the delivery rate",
+                previous,
+                self.capacity.measured(self.now_ns),
+                if replaced && previous.is_some() {
+                    ", replaced"
+                } else {
+                    ""
+                },
+            );
+        }
+
         signals.queue_delay = self
             .queue_delay_ns
             .map(|ns| Duration::from_nanos(ns.max(0.) as u64));
-        signals.capacity = self.capacity;
+        signals.capacity = self.capacity.measured(self.now_ns);
+        signals.capacity_lower_bound = self.capacity.lower_bound(self.now_ns);
         signals
     }
 
     /// Estimates capacity from how a finished drain spread out on arrival.
-    /// If the bottleneck spread it (arrival spread clearly over send spread)
-    /// the sample is averaged in; if the pacer did, it's only a lower bound.
+    /// If the bottleneck spread it (it queued there) the sample measures the
+    /// capacity; if the pacer did, it's only a lower bound.
     fn measure_capacity(&mut self, drain: &Drain) {
         let arrival_spread = drain.last_arrival - drain.start_arrival;
         let send_spread = drain.last_send - drain.first_send;
@@ -426,7 +652,11 @@ impl PacketDetector {
             return;
         }
 
-        let queue_limited = arrival_spread as f64 > QUEUE_LIMITED_SPREAD * send_spread as f64;
+        // Delta frames queued behind a burst stretch how long the drain took
+        // to send as much as to arrive: whether it queued tells better
+        let queue_limited = drain.max_growth
+            > MIN_QUEUE_LIMITED_GROWTH_NS
+                .max((QUEUE_LIMITED_GROWTH * arrival_spread as f64) as i64);
         // Packets the pacer sent in one go can arrive closer together than
         // the link's sustained rate: for a lower bound, go by the slower of
         // sending and arriving
@@ -436,19 +666,21 @@ impl PacketDetector {
             arrival_spread.max(send_spread)
         };
         let sample = bytes as f64 * 8. / spread as f64 * 1e9;
-        let previous = self.capacity;
-        self.capacity = Some(match self.capacity {
+        let at = drain.last_send;
+        let previous = self.capacity.measured(at);
+        let replaced = if queue_limited {
             // The bottleneck spread the burst out: that's its rate
-            Some(capacity) if queue_limited => capacity + CAPACITY_ALPHA * (sample - capacity),
+            self.capacity.add_measurement(sample, at)
+        } else {
             // The pacer spread it out: the link can do at least that much
-            Some(capacity) => capacity.max(sample),
-            None => sample,
-        });
+            self.capacity.add_lower_bound(sample, at);
+            false
+        };
 
         gst::debug!(
             CAT,
             "burst drained: {} bytes arrived over {:.1} ms, sent over {:.1} ms ({}), \
-             {:.0} bit/s: capacity {:?} -> {:?}",
+             {:.0} bit/s: capacity {:?} -> {:?}{} (lower bound {:?})",
             drain.bytes,
             ms(arrival_spread as f64),
             ms(send_spread as f64),
@@ -459,15 +691,14 @@ impl PacketDetector {
             },
             sample,
             previous,
-            self.capacity,
+            self.capacity.measured(at),
+            if replaced && previous.is_some() {
+                ", replaced"
+            } else {
+                ""
+            },
+            self.capacity.lower_bound(at),
         );
-    }
-
-    /// Forget the queue state, e.g. after a decrease: the next samples
-    /// should reflect the new bitrate
-    pub fn reset_queue_delay(&mut self) {
-        gst::trace!(CAT, "queuing delay reset");
-        self.queue_delay_ns = None;
     }
 }
 
@@ -601,6 +832,72 @@ mod tests {
             let signals = detector.update(&p);
             assert!(!signals.drain_overrun, "overrun at frame {i}");
         }
+        // The link never limited a burst: nothing measured, only a bound
+        assert_eq!(detector.capacity(), None);
+        assert!(detector.capacity_lower_bound().is_some());
+    }
+
+    #[test]
+    fn capacity_is_the_median_and_follows_drops_at_once() {
+        let mut capacity = Capacity::default();
+        for (i, sample) in [8e6, 7.8e6, 8.2e6, 8e6].into_iter().enumerate() {
+            capacity.add_measurement(sample, i as i64 * 1000 * MS);
+        }
+        // one jittered sample doesn't move it
+        assert!(!capacity.add_measurement(20e6, 4000 * MS));
+        assert_eq!(capacity.measured(4000 * MS), Some(8e6));
+        // the link getting slower does, right away
+        assert!(capacity.add_measurement(2e6, 5000 * MS));
+        assert_eq!(capacity.measured(5000 * MS), Some(2e6));
+        // and it goes stale without new samples
+        assert_eq!(capacity.measured(5000 * MS + CAPACITY_MAX_AGE_NS + 1), None);
+    }
+
+    #[test]
+    fn lower_bound_ages_out_and_never_becomes_the_capacity() {
+        let mut capacity = Capacity::default();
+        // a burst sent and arriving at 27 Mbps, as at 3:34 in ladder_minimal
+        capacity.add_lower_bound(27e6, 0);
+        capacity.add_lower_bound(1e6, 1000 * MS);
+        assert_eq!(capacity.measured(1000 * MS), None);
+        assert_eq!(capacity.lower_bound(1000 * MS), Some(27e6));
+        assert_eq!(capacity.reference(1000 * MS), Some(27e6));
+        assert_eq!(capacity.lower_bound(LOWER_BOUND_MAX_AGE_NS + 1), None);
+        // once measured, the measurement is what drains are judged against
+        capacity.add_measurement(1.8e6, 2000 * MS);
+        assert_eq!(capacity.reference(2000 * MS), Some(1.8e6));
+    }
+
+    #[test]
+    fn capacity_drop_is_measured_with_the_next_burst() {
+        let mut link = Link {
+            capacity: 8e6,
+            free_at: 0,
+            extra_ns: 0,
+        };
+        let mut detector = PacketDetector::default();
+        for i in 0..50 {
+            let keyframe = i % 25 == 0;
+            let n = if keyframe { 336 } else { 42 };
+            detector.update(&packets(
+                &mut link,
+                i * 100 * MS,
+                1e9,
+                n,
+                (1, i as u32),
+                keyframe,
+            ));
+        }
+        let before = detector.capacity().unwrap();
+        assert!((before - 8e6).abs() < 0.3e6, "{before}");
+
+        // the link drops to 2 Mbps: one keyframe, then a delta frame once
+        // it has drained
+        link.capacity = 2e6;
+        detector.update(&packets(&mut link, 5000 * MS, 1e9, 336, (1, 50), true));
+        detector.update(&packets(&mut link, 7000 * MS, 1e9, 5, (1, 51), false));
+        let after = detector.capacity().unwrap();
+        assert!((after - 2e6).abs() < 0.1e6, "{after}");
     }
 
     #[test]
@@ -649,6 +946,119 @@ mod tests {
                 .drain_overrun;
         }
         assert!(overrun);
+    }
+
+    #[test]
+    fn delta_frames_above_capacity_end_the_drain() {
+        // As in ladder_degraded: capacity measured at 2 Mbps, then the
+        // target climbs past it while a keyframe drains
+        let mut link = Link {
+            capacity: 2e6,
+            free_at: 0,
+            extra_ns: 0,
+        };
+        let mut detector = PacketDetector::default();
+        for i in 0..25 {
+            let keyframe = i % 25 == 0;
+            let n = if keyframe { 50 } else { 10 };
+            let signals = detector.update(&packets(
+                &mut link,
+                i * 100 * MS,
+                1e9,
+                n,
+                (1, i as u32),
+                keyframe,
+            ));
+            assert!(!signals.drain_overrun, "overrun at frame {i}");
+        }
+        assert!(detector.capacity().is_some());
+
+        // a keyframe, then delta frames at 3 Mbps: 50% above the link
+        let mut overrun_at = None;
+        for i in 25..50 {
+            let keyframe = i == 25;
+            let n = if keyframe { 50 } else { 31 };
+            let signals = detector.update(&packets(
+                &mut link,
+                i * 100 * MS,
+                1e9,
+                n,
+                (1, i as u32),
+                keyframe,
+            ));
+            if signals.drain_overrun {
+                overrun_at.get_or_insert(i);
+            }
+        }
+        // the queue grows 50 ms per 100 ms frame: seen within a few frames,
+        // and delta frames show it as queuing delay from then on
+        let overrun_at = overrun_at.expect("no overrun");
+        assert!(overrun_at <= 30, "overrun only at frame {overrun_at}");
+        let queue_delay = detector
+            .update(&packets(&mut link, 5000 * MS, 1e9, 31, (1, 50), false))
+            .queue_delay
+            .unwrap();
+        assert!(queue_delay > Duration::from_millis(100), "{queue_delay:?}");
+    }
+
+    /// Delta frames only, `n` packets every 100 ms, unpaced, through `link`
+    fn delta_frames(
+        link: &mut Link,
+        detector: &mut PacketDetector,
+        frames: std::ops::Range<u32>,
+        n: u32,
+        extra_ns: impl Fn(u32) -> i64,
+    ) {
+        for i in frames {
+            link.extra_ns = extra_ns(i);
+            detector.update(&packets(
+                link,
+                i64::from(i) * 100 * MS,
+                1e9,
+                n,
+                (1, i),
+                false,
+            ));
+        }
+    }
+
+    #[test]
+    fn standing_queue_measures_the_capacity() {
+        // The link drops from 20 to 1 Mbps under 2 Mbps of delta frames,
+        // with no keyframe to measure it with
+        let mut link = Link {
+            capacity: 20e6,
+            free_at: 0,
+            extra_ns: 0,
+        };
+        let mut detector = PacketDetector::default();
+        delta_frames(&mut link, &mut detector, 0..20, 21, |_| 0);
+        assert_eq!(detector.capacity(), None);
+
+        link.capacity = 1e6;
+        delta_frames(&mut link, &mut detector, 20..30, 21, |_| 0);
+        let capacity = detector.capacity().expect("not measured");
+        assert!((capacity - 1e6).abs() < 0.1e6, "{capacity}");
+    }
+
+    #[test]
+    fn longer_path_is_not_a_capacity() {
+        // The path's delay goes up by 60 ms for a while, as in no-netem1:
+        // every packet queues, but the link still keeps up
+        let mut link = Link {
+            capacity: 20e6,
+            free_at: 0,
+            extra_ns: 0,
+        };
+        let mut detector = PacketDetector::default();
+        delta_frames(&mut link, &mut detector, 0..100, 21, |i| {
+            if (20..80).contains(&i) {
+                60 * MS
+            } else {
+                0
+            }
+        });
+        assert_eq!(detector.capacity(), None);
     }
 
     #[test]
