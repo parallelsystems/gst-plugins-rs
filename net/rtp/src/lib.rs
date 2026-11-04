@@ -24,6 +24,7 @@ use gst::glib;
 mod utils;
 
 mod gcc;
+mod pacer;
 mod rtpbin2;
 
 mod audio_discont;
@@ -48,6 +49,7 @@ mod tests;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     gcc::register(plugin)?;
+    pacer::register(plugin)?;
     rtpbin2::register(plugin)?;
 
     #[cfg(feature = "doc")]
