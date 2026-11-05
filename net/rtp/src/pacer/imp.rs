@@ -16,7 +16,15 @@
  * at that rate, or a few frame intervals while a keyframe, or a frame much
  * larger than the usual delta frame, is queued. Rather than sending what
  * doesn't fit as a burst, the pacer then speeds up just enough to drain the
- * queue within that time. Retransmissions skip ahead of queued media.
+ * queue within that time.
+ *
+ * Retransmissions skip ahead of queued media, within a budget of their own,
+ * #rtppacer:rtx-max-ratio times #rtppacer:bitrate, on top of the media.
+ * Retransmissions that waited too long for that budget are dropped, as are
+ * those of a packet already retransmitted within the last round-trip time
+ * (#rtppacer:rtt): the receiver asks again for packets whose retransmission
+ * is lost, and on a congested link answering every request multiplies the
+ * traffic that congested it.
  *
  * Feedback: as packets go through, the pacer classifies them (media in a
  * keyframe or a delta frame, retransmission answering a NACK, other RTX),
@@ -32,7 +40,7 @@
 use gst::{glib, prelude::*, subclass::prelude::*};
 use once_cell::sync::Lazy;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -49,6 +57,7 @@ const DEFAULT_BITRATE: u32 = 2_048_000;
 const DEFAULT_PACING_FACTOR: f64 = 1.5;
 const DEFAULT_FRAMERATE: f64 = 10.;
 const DEFAULT_GOP_SIZE: u32 = 25;
+const DEFAULT_RTX_MAX_RATIO: f64 = 0.5;
 
 /// How often the pacer wakes up to send what its budget allows
 const TICK: Duration = Duration::from_millis(5);
@@ -78,6 +87,17 @@ const SENT_LOG_MAX_AGE: Duration = Duration::from_secs(5);
 /// A retransmission request is answered within this long; RTX packets that
 /// don't answer one are padding
 const RTX_REQUEST_MAX_AGE: Duration = Duration::from_secs(1);
+
+/// Retransmission budget left unused can add up to this long's worth
+const RTX_BUDGET_WINDOW: Duration = Duration::from_millis(50);
+
+/// A retransmission still queued after this long is dropped: the receiver
+/// has asked again or given up on it by then
+const RTX_MAX_QUEUE_TIME: Duration = Duration::from_millis(250);
+
+/// A packet isn't retransmitted again within the round-trip time, nor
+/// within this long while it's unknown
+const MIN_RTX_INTERVAL: Duration = Duration::from_millis(50);
 
 /// What a packet is, as far as feedback is concerned
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +283,10 @@ struct State {
     rtx_pt_map: Option<gst::Structure>,
     /// RTX payload types from rtx_pt_map
     rtx_pts: Vec<u8>,
+    /// Retransmissions may take this many times the bitrate on top of it
+    rtx_max_ratio: f64,
+    /// Round-trip time, none is retransmitted twice within it
+    rtt: Duration,
 
     /// RTX packets, sent before any media
     rtx_queue: VecDeque<Queued>,
@@ -283,6 +307,12 @@ struct State {
     last_push: Option<Instant>,
     /// Sending faster than the pacing rate to keep within the queue time
     speeding_up: bool,
+    /// Bits retransmissions may still send
+    rtx_budget: f64,
+    /// When each (RTX SSRC, original seqnum) was last retransmitted
+    rtx_sent: HashMap<(u32, u16), Instant>,
+    /// Retransmissions dropped since start
+    rtx_dropped: u64,
 
     /// Media streams by SSRC
     streams: Vec<MediaStream>,
@@ -317,6 +347,8 @@ impl Default for State {
             gop_size: DEFAULT_GOP_SIZE,
             rtx_pt_map: None,
             rtx_pts: Vec::new(),
+            rtx_max_ratio: DEFAULT_RTX_MAX_RATIO,
+            rtt: Duration::ZERO,
             rtx_queue: VecDeque::new(),
             media_queue: VecDeque::new(),
             events: VecDeque::new(),
@@ -326,6 +358,9 @@ impl Default for State {
             budget_offset: 0.,
             last_push: None,
             speeding_up: false,
+            rtx_budget: 0.,
+            rtx_sent: HashMap::new(),
+            rtx_dropped: 0,
             streams: Vec::new(),
             frames: VecDeque::new(),
             next_frame_uid: 0,
@@ -344,6 +379,11 @@ impl State {
     /// Rate in bit/sec the queue drains at when it's within its queue time
     fn pacing_rate(&self) -> f64 {
         self.bitrate as f64 * self.pacing_factor
+    }
+
+    /// Rate in bit/sec retransmissions may take on top of the pacing rate
+    fn rtx_rate(&self) -> f64 {
+        self.bitrate as f64 * self.rtx_max_ratio
     }
 
     /// How long the queue may take to drain at the pacing rate with only
@@ -739,7 +779,7 @@ impl State {
         // rather than send what doesn't fit as a burst
         let mut rate = self.pacing_rate();
         let mut ahead_bits = 0.;
-        for queued in self.rtx_queue.iter().chain(self.media_queue.iter()) {
+        for queued in self.media_queue.iter() {
             ahead_bits += queued.buffer.size() as f64 * 8.;
             let left = queued.deadline.saturating_duration_since(now).max(TICK);
             rate = rate.max(ahead_bits / left.as_secs_f64());
@@ -769,63 +809,22 @@ impl State {
             }
         }
 
-        let mut budget = self.budget_offset + rate * elapsed.as_secs_f64();
         let mut output = Vec::new();
+        self.dequeue_rtx(element, now, elapsed, &mut output);
+
+        let mut budget = self.budget_offset + rate * elapsed.as_secs_f64();
         loop {
             self.release_events(&mut output);
             if budget <= 0. {
                 break;
             }
 
-            let queued = match self.rtx_queue.pop_front() {
-                Some(queued) => queued,
-                None => match self.media_queue.pop_front() {
-                    Some(queued) => {
-                        self.media_dequeued += 1;
-                        queued
-                    }
-                    None => break,
-                },
+            let Some(queued) = self.media_queue.pop_front() else {
+                break;
             };
-
-            let size = queued.buffer.size() as u64;
-            budget -= size as f64 * 8.;
-            self.queued_bytes -= size;
-
-            // How long a keyframe sat in the pacer, from its first packet
-            // coming in to its last going out
-            if let Some(frame) = queued
-                .info
-                .filter(|info| info.marker)
-                .and_then(|info| info.frame)
-                .and_then(|uid| self.frame(uid))
-                .filter(|frame| frame.is_burst())
-            {
-                gst::debug!(
-                    CAT,
-                    obj = element,
-                    "{} with RTP timestamp {} ({} bytes) went out over {:?}",
-                    if frame.keyframe {
-                        "Keyframe"
-                    } else {
-                        "Large frame"
-                    },
-                    frame.rtp_ts,
-                    frame.bytes,
-                    now - frame.created,
-                );
-            }
-
-            if let Some(info) = queued.info.filter(|info| info.has_extension) {
-                self.sent.push_back(Sent {
-                    index: self.next_index,
-                    info,
-                    at: now,
-                });
-                self.next_index += 1;
-            }
-
-            output.push(Output::Buffer(queued.buffer));
+            self.media_dequeued += 1;
+            budget -= queued.buffer.size() as f64 * 8.;
+            self.send(element, queued, now, &mut output);
         }
 
         // Budget left over while the queue is empty doesn't carry beyond a
@@ -843,6 +842,108 @@ impl State {
         }
 
         output
+    }
+
+    /// Sends the retransmissions their budget allows, and drops those that
+    /// waited too long or repeat one sent within the round-trip time
+    fn dequeue_rtx(
+        &mut self,
+        element: &super::Pacer,
+        now: Instant,
+        elapsed: Duration,
+        output: &mut Vec<Output>,
+    ) {
+        let rtx_rate = self.rtx_rate();
+        self.rtx_budget = (self.rtx_budget + rtx_rate * elapsed.as_secs_f64())
+            .min(rtx_rate * RTX_BUDGET_WINDOW.as_secs_f64());
+        let interval = self.rtt.max(MIN_RTX_INTERVAL);
+
+        while let Some(queued) = self.rtx_queue.front() {
+            let key = queued
+                .info
+                .and_then(|info| info.osn.map(|osn| (info.ssrc, osn)));
+            let drop_reason = if now.saturating_duration_since(queued.enqueued) > RTX_MAX_QUEUE_TIME
+            {
+                Some("waited too long")
+            } else if key
+                .and_then(|key| self.rtx_sent.get(&key))
+                .is_some_and(|t| now.saturating_duration_since(*t) < interval)
+            {
+                Some("retransmitted within the round-trip time")
+            } else {
+                None
+            };
+
+            if let Some(reason) = drop_reason {
+                let queued = self.rtx_queue.pop_front().unwrap();
+                self.queued_bytes -= queued.buffer.size() as u64;
+                self.rtx_dropped += 1;
+                gst::log!(
+                    CAT,
+                    obj = element,
+                    "Dropping retransmission of {:?}: {reason} ({} dropped so far)",
+                    key,
+                    self.rtx_dropped,
+                );
+                continue;
+            }
+
+            if self.rtx_budget <= 0. {
+                break;
+            }
+            let queued = self.rtx_queue.pop_front().unwrap();
+            self.rtx_budget -= queued.buffer.size() as f64 * 8.;
+            if let Some(key) = key {
+                self.rtx_sent.insert(key, now);
+            }
+            self.send(element, queued, now, output);
+        }
+    }
+
+    /// Sends a dequeued packet, logging it for feedback
+    fn send(
+        &mut self,
+        element: &super::Pacer,
+        queued: Queued,
+        now: Instant,
+        output: &mut Vec<Output>,
+    ) {
+        self.queued_bytes -= queued.buffer.size() as u64;
+
+        // How long a keyframe sat in the pacer, from its first packet
+        // coming in to its last going out
+        if let Some(frame) = queued
+            .info
+            .filter(|info| info.marker)
+            .and_then(|info| info.frame)
+            .and_then(|uid| self.frame(uid))
+            .filter(|frame| frame.is_burst())
+        {
+            gst::debug!(
+                CAT,
+                obj = element,
+                "{} with RTP timestamp {} ({} bytes) went out over {:?}",
+                if frame.keyframe {
+                    "Keyframe"
+                } else {
+                    "Large frame"
+                },
+                frame.rtp_ts,
+                frame.bytes,
+                now - frame.created,
+            );
+        }
+
+        if let Some(info) = queued.info.filter(|info| info.has_extension) {
+            self.sent.push_back(Sent {
+                index: self.next_index,
+                info,
+                at: now,
+            });
+            self.next_index += 1;
+        }
+
+        output.push(Output::Buffer(queued.buffer));
     }
 
     /// Forgets sent packets, frames and retransmission requests too old to
@@ -870,6 +971,9 @@ impl State {
         {
             self.rtx_requests.pop_front();
         }
+
+        self.rtx_sent
+            .retain(|_, t| now.saturating_duration_since(*t) <= RTX_REQUEST_MAX_AGE);
     }
 
     /// Extends a 16-bit TWCC seqnum to 64 bits, relative to the highest
@@ -1341,6 +1445,24 @@ impl ObjectImpl for Pacer {
                     .blurb("Map of original payload types to RTX payload types, as rtprtxsend's payload-type-map")
                     .mutable_playing()
                     .build(),
+                glib::ParamSpecDouble::builder("rtx-max-ratio")
+                    .nick("RTX Max Ratio")
+                    .blurb("Retransmissions may take at most this many times the bitrate, on top of it")
+                    .minimum(0.)
+                    .maximum(10.)
+                    .default_value(DEFAULT_RTX_MAX_RATIO)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecUInt64::builder("rtt")
+                    .nick("Round-trip time")
+                    .blurb("Round-trip time in nanoseconds, a packet isn't retransmitted again within it (at least 50 ms), 0 if unknown")
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecUInt64::builder("rtx-dropped")
+                    .nick("RTX Dropped")
+                    .blurb("Retransmissions dropped for waiting too long or repeating one within the round-trip time")
+                    .read_only()
+                    .build(),
                 glib::ParamSpecUInt64::builder("queued-bytes")
                     .nick("Queued Bytes")
                     .blurb("Bytes waiting in the pacer's queue")
@@ -1412,6 +1534,15 @@ impl ObjectImpl for Pacer {
                     state.keyframe_queue_time()
                 );
             }
+            "rtx-max-ratio" => {
+                state.rtx_max_ratio = value.get().expect("type checked upstream");
+                gst::info!(CAT, imp = self, "RTX max ratio {}", state.rtx_max_ratio);
+            }
+            "rtt" => {
+                let rtt = Duration::from_nanos(value.get().expect("type checked upstream"));
+                gst::log!(CAT, imp = self, "Round-trip time {rtt:?}");
+                state.rtt = rtt;
+            }
             "rtx-payload-type-map" => {
                 state.set_rtx_pt_map(value.get().expect("type checked upstream"));
                 gst::info!(
@@ -1434,6 +1565,9 @@ impl ObjectImpl for Pacer {
             "framerate" => state.framerate.to_value(),
             "gop-size" => state.gop_size.to_value(),
             "rtx-payload-type-map" => state.rtx_pt_map.to_value(),
+            "rtx-max-ratio" => state.rtx_max_ratio.to_value(),
+            "rtt" => (state.rtt.as_nanos() as u64).to_value(),
+            "rtx-dropped" => state.rtx_dropped.to_value(),
             "queued-bytes" => state.queued_bytes.to_value(),
             _ => unimplemented!(),
         }
@@ -1629,7 +1763,7 @@ mod tests {
 
         let start = Instant::now();
         state.last_push = Some(start);
-        let sent = state.dequeue(&element(), start + Duration::from_secs(1));
+        let sent = state.dequeue(&element(), start + Duration::from_millis(100));
         assert_eq!(sent.len(), 5);
         let kinds = state.sent.iter().map(|s| s.info.kind).collect::<Vec<_>>();
         assert_eq!(
@@ -1642,6 +1776,90 @@ mod tests {
                 Kind::Media
             ]
         );
+    }
+
+    /// Queues retransmissions of `osns`, requested, at `at`
+    fn rtx_at(state: &mut State, rtx_seqnum: &mut u16, osns: &[u16], at: Instant) {
+        for &osn in osns {
+            state.rtx_requests.push_back((osn, at));
+            state.enqueue(
+                &element(),
+                rtp_buffer(97, *rtx_seqnum, 0, 1200, false, false, Some(osn)),
+                at,
+            );
+            *rtx_seqnum = rtx_seqnum.wrapping_add(1);
+        }
+    }
+
+    fn rtx_state() -> State {
+        let mut state = State {
+            bitrate: 2_000_000,
+            ..Default::default()
+        };
+        state.set_rtx_pt_map(Some(
+            gst::Structure::builder("application/x-rtp-pt-map")
+                .field("96", 97u32)
+                .build(),
+        ));
+        state
+    }
+
+    #[test]
+    fn retransmissions_are_limited_to_their_budget() {
+        // As in hitl1105: requests for ~1300 packets/s against a 2 Mbps
+        // stream. At most rtx-max-ratio x bitrate goes out, the rest is
+        // dropped once stale rather than sent all at once later.
+        init();
+        let mut state = rtx_state();
+        let start = Instant::now();
+        state.last_push = Some(start);
+        let mut rtx_seqnum = 0;
+        let mut t = start;
+        let mut sent_bits = 0.;
+        for i in 0..400u32 {
+            t += TICK;
+            // ~6.5 requests per 5 ms tick, each for a different packet
+            let osns: Vec<u16> = (0..7).map(|j| (i * 7 + j) as u16).collect();
+            rtx_at(&mut state, &mut rtx_seqnum, &osns, t);
+            for out in state.dequeue(&element(), t) {
+                if let Output::Buffer(b) = out {
+                    sent_bits += b.size() as f64 * 8.;
+                }
+            }
+        }
+        let secs = (t - start).as_secs_f64();
+        let rate = sent_bits / secs;
+        // 1 Mbps, plus at most the budget window saved up at the start
+        assert!(rate <= 1.05e6, "{rate:.0} bit/s of retransmissions");
+        assert!(rate >= 0.9e6, "{rate:.0} bit/s of retransmissions");
+        assert!(state.rtx_dropped > 0);
+        // nothing older than RTX_MAX_QUEUE_TIME is left waiting
+        assert!(state
+            .rtx_queue
+            .iter()
+            .all(|q| t - q.enqueued <= RTX_MAX_QUEUE_TIME));
+    }
+
+    #[test]
+    fn repeated_requests_within_the_rtt_are_dropped() {
+        init();
+        let mut state = rtx_state();
+        state.rtt = Duration::from_millis(100);
+        let start = Instant::now();
+        state.last_push = Some(start);
+        let mut rtx_seqnum = 0;
+
+        rtx_at(&mut state, &mut rtx_seqnum, &[5], start);
+        assert_eq!(state.dequeue(&element(), start + TICK * 4).len(), 1);
+        // asked again before the retransmission could have arrived
+        let t = start + Duration::from_millis(60);
+        rtx_at(&mut state, &mut rtx_seqnum, &[5], t);
+        assert_eq!(state.dequeue(&element(), t + TICK).len(), 0);
+        assert_eq!(state.rtx_dropped, 1);
+        // asked again after a round trip: the retransmission was lost
+        let t = start + Duration::from_millis(150);
+        rtx_at(&mut state, &mut rtx_seqnum, &[5], t);
+        assert_eq!(state.dequeue(&element(), t + TICK * 4).len(), 1);
     }
 
     #[test]

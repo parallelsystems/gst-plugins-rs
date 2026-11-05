@@ -4576,7 +4576,7 @@ impl ObjectImpl for BaseWebRTCSink {
                     .build(),
                 /**
                  * GstBaseWebRTCSink::cc-detector-changed:
-                 * @capacity: measured bottleneck capacity, in bps. 
+                 * @capacity: measured bottleneck capacity, in bps.
                  * @capacity-lower-bound: rate the link recently carried at least, in bps
                  * @queue-delay: smoothed queuing delay of delta frames, in ns
                  *

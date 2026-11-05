@@ -151,6 +151,14 @@ const MIN_LOSS_PACKETS: usize = 10;
 /// Smoothing factor of the retransmission rate, per feedback
 const RTX_RATE_ALPHA: f64 = 0.2;
 
+/// The encoders are given a new bitrate when the target changes, or when
+/// their share of it (the target minus retransmissions) moves by more than
+/// this fraction of what they were last given
+const ENCODER_BITRATE_HYSTERESIS: f64 = 0.05;
+
+/// The pacer is told a new round-trip time when it moves by more than this
+const PACER_RTT_HYSTERESIS: Duration = Duration::from_millis(5);
+
 /// Whether the queue grew enough since the last cut, when it was
 /// `at_cut`, for another one: at least doubled, and by QUEUE_DELAY_OVERUSE.
 /// A cut leaves the queue to drain at whatever the link has to spare, which
@@ -159,6 +167,14 @@ const RTX_RATE_ALPHA: f64 = 0.2;
 /// can drain.
 fn queue_grew_since_cut(queue_delay: Duration, at_cut: Duration) -> bool {
     queue_delay > at_cut + at_cut.max(QUEUE_DELAY_OVERUSE)
+}
+
+/// Whether the encoders' share of the target, now `share`, moved far
+/// enough from what they were last given, `applied`, to give it to them
+fn encoder_share_moved(applied: Option<i32>, share: i32) -> bool {
+    applied.map_or(true, |applied| {
+        f64::from((share - applied).abs()) > ENCODER_BITRATE_HYSTERESIS * f64::from(applied)
+    })
 }
 
 /// Seconds since `last`, bounded by MAX_INCREASE_INTERVAL, 0 on the first update
@@ -453,6 +469,8 @@ pub struct CongestionController {
     /// Smoothed rate of retransmissions, bit/sec: they share the link with
     /// the encoders, so the encoders get the target minus this
     rtx_rate: f64,
+    /// Bitrate each encoder was last given
+    applied_encoder_bitrate: Option<i32>,
     /// Latest round-trip time from the stats, seconds
     rtt: f64,
     /// For logging purposes
@@ -491,6 +509,7 @@ impl CongestionController {
             delta_packets: 0,
             delta_lost: 0,
             rtx_rate: 0.,
+            applied_encoder_bitrate: None,
             rtt: 0.,
             peer_id: peer_id.to_string(),
             min_bitrate,
@@ -1254,7 +1273,8 @@ impl CongestionController {
         )
     }
 
-    /// Tells the pacer the framerate and GOP length the encoders run at
+    /// Tells the pacer the framerate and GOP length the encoders run at,
+    /// and the round-trip time
     fn update_pacer_params(&self, encoders: &[VideoEncoder]) {
         let Some(pacer) = self.pacer.as_ref() else {
             return;
@@ -1273,6 +1293,16 @@ impl CongestionController {
                     self.peer_id
                 );
                 pacer.set_property("framerate", framerate.clamp(1., 1000.));
+            }
+        }
+
+        // So it doesn't retransmit a packet again before the first
+        // retransmission could have arrived
+        if self.rtt > 0. && pacer.has_property("rtt", Some(u64::static_type())) {
+            let rtt = Duration::from_secs_f64(self.rtt);
+            let current = Duration::from_nanos(pacer.property::<u64>("rtt"));
+            if rtt.max(current) - rtt.min(current) > PACER_RTT_HYSTERESIS {
+                pacer.set_property("rtt", rtt.as_nanos() as u64);
             }
         }
 
@@ -1405,7 +1435,12 @@ impl CongestionController {
         let encoders_bitrate = f64::max(total_bitrate as f64 - self.rtx_rate, min_total as f64);
         let target_bitrate = encoders_bitrate as i32 / n_encoders;
 
-        if total_bitrate != prev_bitrate {
+        // The share moves with the retransmission rate while the target
+        // holds: during a retransmission storm the encoders must give way
+        if total_bitrate != prev_bitrate
+            || encoder_share_moved(self.applied_encoder_bitrate, target_bitrate)
+        {
+            self.applied_encoder_bitrate = Some(target_bitrate);
             if let Some(pacer) = self.pacer.as_ref() {
                 pacer.set_property("bitrate", total_bitrate.max(1) as u32);
             }
@@ -1479,6 +1514,17 @@ mod tests {
             Some((IncreaseType::FastRecovery(f), _)) => Some(f),
             _ => None,
         }
+    }
+
+    #[test]
+    fn encoders_follow_the_retransmission_rate() {
+        // hitl1105: the target held at 2.16 Mbps while retransmissions
+        // took most of the link, and the encoders kept 2.16 Mbps
+        assert!(encoder_share_moved(None, 2_160_000));
+        assert!(!encoder_share_moved(Some(2_160_000), 2_100_000));
+        assert!(encoder_share_moved(Some(2_160_000), 1_080_000));
+        // and back up once they fade
+        assert!(encoder_share_moved(Some(1_080_000), 2_160_000));
     }
 
     #[test]

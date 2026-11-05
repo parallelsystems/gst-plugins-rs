@@ -60,6 +60,15 @@ const MAX_DRAIN_NS: f64 = 2_000_000_000.;
 /// queue grows on delta frames alone, sent faster than the link carries,
 /// and the drain would never end
 const DELTA_QUEUE_GROWTH_NS: i64 = 40_000_000;
+/// A drain ends at the first delta frame packet sent this long after the
+/// burst's last packet...
+const DRAIN_MAX_TAIL_NS: i64 = 1_000_000_000;
+/// ... or this long after the drain started, whatever the packets queued.
+/// A drain whose first packet happened to arrive early compared to the
+/// path's jitter sees every later packet as queued behind it, and with
+/// bursts (keyframes, retransmissions) keeping it going it would otherwise
+/// never end, leaving the queuing delay without samples.
+const DRAIN_MAX_SPAN_NS: i64 = 2_000_000_000;
 
 /// A drain spanning at least this many bytes and this long measures the
 /// capacity
@@ -212,6 +221,8 @@ struct Drain {
     last_arrival: i64,
     first_send: i64,
     last_send: i64,
+    /// Send time of the last burst packet in the drain
+    last_burst_send: i64,
     first_size: u32,
     bytes: u64,
     /// Most queue the drain built up, ns
@@ -228,6 +239,7 @@ impl Drain {
             last_arrival: arrival,
             first_send: p.send_ns,
             last_send: p.send_ns,
+            last_burst_send: p.send_ns,
             first_size: p.size,
             bytes: u64::from(p.size),
             max_growth: 0,
@@ -244,7 +256,15 @@ impl Drain {
         self.max_growth = self.max_growth.max(growth);
         if p.is_burst() {
             self.burst_max_growth = self.burst_max_growth.max(growth);
+            self.last_burst_send = self.last_burst_send.max(p.send_ns);
         }
+    }
+
+    /// Whether a packet sent at `send` is too long after the burst, or after
+    /// the start of the drain, to still be queued behind it
+    fn expired(&self, send: i64) -> bool {
+        send - self.last_burst_send > DRAIN_MAX_TAIL_NS
+            || send - self.first_send > DRAIN_MAX_SPAN_NS
     }
 
     /// How much more one-way delay a packet sent at `send` and arriving at
@@ -549,27 +569,41 @@ impl PacketDetector {
                 let overdue = drain.overdue(p.send_ns, arrival, capacity);
                 let growing = drain.queue_growing(p.send_ns, arrival);
 
-                if queued_behind && !overdue && !growing {
+                let overrun = queued_behind && (overdue || growing);
+
+                if !overrun && drain.expired(p.send_ns) {
+                    // How long it ran says nothing about the link's rate,
+                    // and this packet's queuing delay is the queue's
+                    gst::debug!(
+                        CAT,
+                        "drain ended {:.1} ms after its last burst packet, {:.1} ms after it \
+                         started, with {:.1} ms more delay than its first packet",
+                        ms((p.send_ns - drain.last_burst_send) as f64),
+                        ms((p.send_ns - drain.first_send) as f64),
+                        ms(drain.delay_growth(p.send_ns, arrival) as f64),
+                    );
+                    self.drain = None;
+                } else if queued_behind && !overrun {
                     // Queued behind the burst: says nothing about the network
                     drain.add(p, arrival);
                     continue;
+                } else {
+                    if overrun {
+                        drain.log_overrun(
+                            p.send_ns,
+                            arrival,
+                            capacity,
+                            if growing {
+                                "delta frames queued longer than the burst before them"
+                            } else {
+                                "delta frames still queued behind a burst"
+                            },
+                        );
+                        signals.drain_overrun = true;
+                    }
+                    let drain = self.drain.take().unwrap();
+                    self.measure_capacity(&drain);
                 }
-
-                if queued_behind {
-                    drain.log_overrun(
-                        p.send_ns,
-                        arrival,
-                        capacity,
-                        if growing {
-                            "delta frames queued longer than the burst before them"
-                        } else {
-                            "delta frames still queued behind a burst"
-                        },
-                    );
-                    signals.drain_overrun = true;
-                }
-                let drain = self.drain.take().unwrap();
-                self.measure_capacity(&drain);
             }
 
             if p.is_delta() && p.frame != self.last_delta_frame {
@@ -1002,6 +1036,38 @@ mod tests {
     }
 
     /// Delta frames only, `n` packets every 100 ms, unpaced, through `link`
+    #[test]
+    fn early_burst_packet_does_not_keep_the_drain_going() {
+        // As in hitl1105: each keyframe's first packet arrives 10 ms early
+        // (jitter), so every packet after it looks queued behind it, and
+        // the next keyframe comes before the drain is over. Without a limit
+        // the drain never ends and the queuing delay is never sampled.
+        let mut link = Link {
+            capacity: 100e6,
+            free_at: 0,
+            extra_ns: 0,
+        };
+        let mut detector = PacketDetector::default();
+        let mut samples = 0;
+        for i in 0..100u32 {
+            let keyframe = i % 10 == 0;
+            let n = if keyframe { 50 } else { 10 };
+            let mut p = packets(&mut link, i64::from(i) * 100 * MS, 1e9, n, (1, i), keyframe);
+            if keyframe {
+                *p[0].arrival_ns.as_mut().unwrap() -= 10 * MS;
+            }
+            let signals = detector.update(&p);
+            assert!(!signals.drain_overrun, "overrun at frame {i}");
+            if i >= 50 {
+                samples += signals.delay_samples;
+            }
+        }
+        // a sample at least every DRAIN_MAX_SPAN_NS
+        assert!(samples >= 2, "{samples} delay samples");
+        let queue_delay = detector.queue_delay_ns.unwrap();
+        assert!(queue_delay < 15. * MS as f64, "{queue_delay}");
+    }
+
     fn delta_frames(
         link: &mut Link,
         detector: &mut PacketDetector,
