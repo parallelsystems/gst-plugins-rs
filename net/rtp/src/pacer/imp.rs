@@ -74,12 +74,19 @@ const KEYFRAME_QUEUE_FRAMES: f64 = 3.;
 /// well before the next one is due
 const KEYFRAME_QUEUE_GOP_FRACTION: f64 = 0.5;
 
-/// A frame this many times the average delta frame is paced like a keyframe,
-/// e.g. an intra frame the encoder doesn't flag as one
+/// A frame this many times the median delta frame is paced like a keyframe,
+/// e.g. an intra frame the encoder doesn't flag as one...
 const LARGE_FRAME_RATIO: f64 = 3.;
 
-/// Smoothing factor of the average delta frame size
-const DELTA_FRAME_SIZE_ALPHA: f64 = 0.1;
+/// ... if it also takes longer than this many frame intervals to send at
+/// the bitrate: a smaller one is sent before the next frame comes, whatever
+/// the frames before it were (e.g. tiny frames of a static scene at start)
+const LARGE_FRAME_MIN_INTERVALS: f64 = 1.5;
+
+/// The median delta frame is taken over the last GOP of them, within these
+/// bounds (all of them when the GOP is unknown)
+const MIN_DELTA_FRAME_WINDOW: usize = 5;
+const MAX_DELTA_FRAME_WINDOW: usize = 50;
 
 /// Sent packets and frames are kept this long waiting for their feedback
 const SENT_LOG_MAX_AGE: Duration = Duration::from_secs(5);
@@ -189,10 +196,25 @@ struct MediaStream {
     delta_flags_seen: bool,
     /// Frames since the last keyframe, None before the first one
     frames_since_keyframe: Option<u64>,
-    /// Moving average of the delta frame size, to spot large frames
-    avg_delta_frame_bytes: Option<f64>,
+    /// Sizes of the last delta frames, large ones included, so a lasting
+    /// change in frame size becomes the norm within half a window
+    delta_frame_bytes: VecDeque<u64>,
+    /// Median of `delta_frame_bytes`, to spot large frames
+    median_delta_frame_bytes: Option<f64>,
     /// The frame being received
     current: Option<u64>,
+}
+
+/// Median of frame sizes, None if there are none
+fn median(sizes: &VecDeque<u64>) -> Option<f64> {
+    let mut sorted = sizes.iter().copied().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    match sorted.len() {
+        0 => None,
+        len if len % 2 == 0 => Some((sorted[mid - 1] + sorted[mid]) as f64 / 2.),
+        _ => Some(sorted[mid] as f64),
+    }
 }
 
 /// A packet waiting in the pacer
@@ -520,7 +542,8 @@ impl State {
                     ssrc,
                     delta_flags_seen: false,
                     frames_since_keyframe: None,
-                    avg_delta_frame_bytes: None,
+                    delta_frame_bytes: VecDeque::new(),
+                    median_delta_frame_bytes: None,
                     current: None,
                 });
                 self.streams.len() - 1
@@ -604,23 +627,22 @@ impl State {
         if delta_unit {
             self.streams[stream_idx].delta_flags_seen = true;
         }
-        let avg = self.streams[stream_idx].avg_delta_frame_bytes;
+        let median = self.streams[stream_idx].median_delta_frame_bytes;
+        let threshold = self.large_frame_bytes(median);
         let frame = self.frame_mut(uid).unwrap();
         frame.bytes += u64::from(payload_len);
         frame.packets += 1;
-        if !frame.keyframe
-            && !frame.large
-            && avg.is_some_and(|avg| frame.bytes as f64 > LARGE_FRAME_RATIO * avg)
-        {
+        if !frame.keyframe && !frame.large && frame.bytes as f64 > threshold {
             frame.large = true;
             gst::debug!(
                 CAT,
                 obj = element,
                 "Frame on ssrc {ssrc:#x} (RTP timestamp {rtp_ts}) is over {} bytes, more than \
-                 {LARGE_FRAME_RATIO}x the average delta frame ({:.0} bytes): pacing it like a \
-                 keyframe",
+                 {threshold:.0} ({LARGE_FRAME_RATIO}x the median delta frame of {:?} bytes, at \
+                 least {LARGE_FRAME_MIN_INTERVALS} frame intervals at the bitrate): pacing it \
+                 like a keyframe",
                 frame.bytes,
-                avg.unwrap_or(0.),
+                median.map(f64::round),
             );
         }
 
@@ -631,10 +653,28 @@ impl State {
         (uid, frame_start)
     }
 
-    /// Marks a frame complete once its last packet is in, and folds delta
-    /// frames into the stream's average frame size
+    /// Size above which a delta frame is a large frame, given the median
+    /// delta frame: none is before there's one to compare with
+    fn large_frame_bytes(&self, median: Option<f64>) -> f64 {
+        let min = LARGE_FRAME_MIN_INTERVALS * self.bitrate as f64 / 8. / self.framerate;
+        median.map_or(f64::INFINITY, |median| {
+            f64::max(LARGE_FRAME_RATIO * median, min)
+        })
+    }
+
+    /// How many delta frames the median is taken over
+    fn delta_frame_window(&self) -> usize {
+        match self.gop_size {
+            0 => MAX_DELTA_FRAME_WINDOW,
+            gop_size => (gop_size as usize).clamp(MIN_DELTA_FRAME_WINDOW, MAX_DELTA_FRAME_WINDOW),
+        }
+    }
+
+    /// Marks a frame complete once its last packet is in, and adds delta
+    /// frames to the stream's recent frame sizes
     fn finish_frame(&mut self, element: &super::Pacer, stream_idx: usize, uid: u64) {
-        let avg_delta_frame_bytes = self.streams[stream_idx].avg_delta_frame_bytes;
+        let median_delta_frame_bytes = self.streams[stream_idx].median_delta_frame_bytes;
+        let window = self.delta_frame_window();
         let Some(frame) = self.frame_mut(uid) else {
             return;
         };
@@ -647,7 +687,7 @@ impl State {
             gst::debug!(
                 CAT,
                 obj = element,
-                "{} with RTP timestamp {} complete: {} bytes in {} packets (average delta frame \
+                "{} with RTP timestamp {} complete: {} bytes in {} packets (median delta frame \
                  {:?} bytes)",
                 if frame.keyframe {
                     "Keyframe"
@@ -657,19 +697,21 @@ impl State {
                 frame.rtp_ts,
                 frame.bytes,
                 frame.packets,
-                avg_delta_frame_bytes.map(f64::round),
+                median_delta_frame_bytes.map(f64::round),
             );
         }
 
-        // Keyframes and large frames would make the average useless for
-        // telling them apart
-        if !frame.is_burst() {
-            let bytes = frame.bytes as f64;
+        // Large frames count too: the median ignores the odd one, but leaving
+        // them out would never let a lasting rise in frame size become the
+        // norm, and every frame after it would stay large
+        if !frame.keyframe {
+            let bytes = frame.bytes;
             let stream = &mut self.streams[stream_idx];
-            stream.avg_delta_frame_bytes = Some(match stream.avg_delta_frame_bytes {
-                Some(avg) => avg + DELTA_FRAME_SIZE_ALPHA * (bytes - avg),
-                None => bytes,
-            });
+            stream.delta_frame_bytes.push_back(bytes);
+            while stream.delta_frame_bytes.len() > window {
+                stream.delta_frame_bytes.pop_front();
+            }
+            stream.median_delta_frame_bytes = median(&stream.delta_frame_bytes);
         }
     }
 
@@ -1714,7 +1756,11 @@ mod tests {
     #[test]
     fn keyframes_and_large_frames() {
         init();
-        let mut state = State::default();
+        // low enough for the frame sizes alone to tell large frames apart
+        let mut state = State {
+            bitrate: 100_000,
+            ..Default::default()
+        };
         let mut seqnum = 0;
 
         frame(&mut state, &mut seqnum, 0, 10, 1000, false);
@@ -1731,8 +1777,96 @@ mod tests {
         assert!(frames[1..5].iter().all(|f| !f.is_burst()));
         assert!(!frames[5].keyframe && frames[5].large);
         assert!(frames[6].keyframe && frames[6].requested);
-        assert_eq!(state.streams[0].avg_delta_frame_bytes, Some(2000.));
+        // the large frame counts towards the median, without moving it
+        assert_eq!(state.streams[0].median_delta_frame_bytes, Some(2000.));
         assert!(state.burst_queued());
+    }
+
+    /// Queues `count` delta frames of `packets` packets of `size` bytes
+    /// after frame `*n`, returning whether each was a large frame
+    fn delta_frames(
+        state: &mut State,
+        seqnum: &mut u16,
+        n: &mut u32,
+        count: u32,
+        packets: u32,
+        size: u32,
+    ) -> Vec<bool> {
+        (0..count)
+            .map(|_| {
+                *n += 1;
+                frame(state, seqnum, *n * 9000, packets, size, true);
+                state.frames.back().unwrap().large
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tiny_frames_at_start_do_not_make_every_frame_large() {
+        init();
+        for bitrate in [1_260_000, 500_000] {
+            let mut state = State {
+                bitrate,
+                gop_size: 10,
+                ..Default::default()
+            };
+            let (mut seqnum, mut n) = (0, 0);
+
+            // a static scene before the cameras are up, then real video
+            frame(&mut state, &mut seqnum, 0, 10, 1000, false);
+            delta_frames(&mut state, &mut seqnum, &mut n, 30, 1, 125);
+            let large = delta_frames(&mut state, &mut seqnum, &mut n, 50, 14, 1200);
+
+            if bitrate == 1_260_000 {
+                // under 1.5 frame intervals at the bitrate: never large
+                assert!(large.iter().all(|large| !large), "{large:?}");
+            } else {
+                // the median takes over within half a GOP
+                assert!(large[6..].iter().all(|large| !large), "{large:?}");
+            }
+            assert_eq!(state.streams[0].median_delta_frame_bytes, Some(16800.));
+        }
+    }
+
+    #[test]
+    fn growing_frames_are_never_large() {
+        init();
+        // the bitrate out of the way: the median alone keeps up
+        let mut state = State {
+            bitrate: 100_000,
+            gop_size: 25,
+            ..Default::default()
+        };
+        let (mut seqnum, mut n) = (0, 0);
+
+        frame(&mut state, &mut seqnum, 0, 10, 1000, false);
+        // 8% larger every second, from 1 to 5 Mbps worth of frames
+        let mut size = 1_000_000. / 8. / 10.;
+        while size < 5_000_000. / 8. / 10. {
+            let large = delta_frames(&mut state, &mut seqnum, &mut n, 10, 10, (size / 10.) as u32);
+            assert!(large.iter().all(|large| !large), "{size}: {large:?}");
+            size *= 1.08;
+        }
+    }
+
+    #[test]
+    fn large_frame_in_a_static_scene() {
+        init();
+        let mut state = State {
+            bitrate: 1_260_000,
+            gop_size: 25,
+            ..Default::default()
+        };
+        let (mut seqnum, mut n) = (0, 0);
+
+        frame(&mut state, &mut seqnum, 0, 10, 1000, false);
+        delta_frames(&mut state, &mut seqnum, &mut n, 20, 2, 1000);
+        // 15x the usual frame and over 1.5 frame intervals at the bitrate
+        let large = delta_frames(&mut state, &mut seqnum, &mut n, 1, 25, 1200);
+        assert_eq!(large, [true]);
+        let large = delta_frames(&mut state, &mut seqnum, &mut n, 5, 2, 1000);
+        assert!(large.iter().all(|large| !large));
+        assert_eq!(state.streams[0].median_delta_frame_bytes, Some(2000.));
     }
 
     #[test]
