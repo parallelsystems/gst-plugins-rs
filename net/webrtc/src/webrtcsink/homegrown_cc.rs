@@ -518,6 +518,11 @@ impl CongestionController {
         }
     }
 
+    /// The `rtppacer` the controller paces through, if any
+    pub fn pacer(&self) -> Option<&gst::Element> {
+        self.pacer.as_ref()
+    }
+
     /// Whether the controller runs on the pacer's per-packet feedback
     /// rather than the aggregate TWCC stats
     fn packet_level(&self) -> bool {

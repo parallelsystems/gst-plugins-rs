@@ -1264,9 +1264,20 @@ impl SessionInner {
             .map(|s| s.to_send_value())
             .collect::<gst::Array>();
 
-        let our_stats = gst::Structure::builder("application/x-webrtcsink-consumer-stats")
+        let mut our_stats = gst::Structure::builder("application/x-webrtcsink-consumer-stats")
             .field("video-encoders", encoder_stats)
             .build();
+
+        // The pacer's RTPPacerStats of the last second, with the homegrown
+        // congestion controller
+        if let Some(pacer) = self
+            .congestion_controller
+            .as_ref()
+            .and_then(CongestionController::pacer)
+            .filter(|pacer| pacer.find_property("stats").is_some())
+        {
+            our_stats.set("pacer", pacer.property::<gst::Structure>("stats"));
+        }
 
         ret.set("consumer-stats", our_stats);
 
