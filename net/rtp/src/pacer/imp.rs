@@ -32,6 +32,13 @@
  * against what it sent, and emits #rtppacer::packet-feedback with the
  * annotated packets.
  *
+ * Stats: #rtppacer:stats holds, for the last second and per kind of
+ * packet, how long packets waited in the pacer, how long retransmissions
+ * took to go out after their NACK, and the one-way delay feedback reported
+ * for them over the lowest of the last 10 s (the queuing on the path, as
+ * sender and receiver clocks differ).
+ * Each feedback packet also carries its `pacer-delay`.
+ *
  * Keyframes are recognised from the buffers' DELTA_UNIT flag, which the
  * H.264/H.265 payloaders copy from the encoder. Payloaders that never set
  * the flag get none of their frames treated as keyframes, only as large
@@ -88,6 +95,14 @@ const LARGE_FRAME_MIN_INTERVALS: f64 = 1.5;
 const MIN_DELTA_FRAME_WINDOW: usize = 5;
 const MAX_DELTA_FRAME_WINDOW: usize = 50;
 
+/// Stats are gathered over this long, then kept in `stats`
+const STATS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The one-way delay of an empty path is the lowest over this long, in
+/// buckets so old lows age out
+const NETWORK_BASE_WINDOW_NS: i64 = 10_000_000_000;
+const NETWORK_BASE_BUCKET_NS: i64 = 1_000_000_000;
+
 /// Sent packets and frames are kept this long waiting for their feedback
 const SENT_LOG_MAX_AGE: Duration = Duration::from_secs(5);
 
@@ -118,6 +133,17 @@ enum Kind {
 }
 
 impl Kind {
+    const ALL: [Kind; 3] = [Kind::Media, Kind::RtxRepair, Kind::RtxPadding];
+
+    /// Position in Kind::ALL
+    fn index(self) -> usize {
+        match self {
+            Kind::Media => 0,
+            Kind::RtxRepair => 1,
+            Kind::RtxPadding => 2,
+        }
+    }
+
     /// Name used for the `kind` field of the feedback
     fn as_str(self) -> &'static str {
         match self {
@@ -153,6 +179,8 @@ struct PacketInfo {
     frame_start: bool,
     /// RTX: the sequence number of the packet it carries
     osn: Option<u16>,
+    /// RTX repair: when the retransmission was requested
+    requested_at: Option<Instant>,
 }
 
 /// A video frame, as seen in its packets
@@ -246,6 +274,148 @@ struct Sent {
     info: PacketInfo,
     /// When it left the pacer
     at: Instant,
+    /// How long it waited in the pacer
+    pacer_delay: Duration,
+}
+
+/// Delays of one kind of packet over a stats interval, in microseconds
+#[derive(Debug, Default)]
+struct DelaySamples(Vec<f64>);
+
+impl DelaySamples {
+    fn push(&mut self, delay: Duration) {
+        self.0.push(delay.as_secs_f64() * 1e6);
+    }
+
+    /// Same, from a delay in ns that can be negative
+    fn push_ns(&mut self, ns: i64) {
+        self.0.push(ns as f64 / 1e3);
+    }
+
+    /// Adds `<name>-mean-us`, `<name>-p95-us` and `<name>-max-us`, in whole
+    /// microseconds, if there are samples
+    fn add_fields(
+        &mut self,
+        mut s: gst::structure::Builder,
+        name: &str,
+    ) -> gst::structure::Builder {
+        if self.0.is_empty() {
+            return s;
+        }
+        self.0.sort_by(f64::total_cmp);
+        let us = |us: f64| us.round() as i64;
+        let mean = self.0.iter().sum::<f64>() / self.0.len() as f64;
+        let p95 = self.0[(0.95 * (self.0.len() - 1) as f64).round() as usize];
+        s = s
+            .field(format!("{name}-mean-us"), us(mean))
+            .field(format!("{name}-p95-us"), us(p95))
+            .field(format!("{name}-max-us"), us(*self.0.last().unwrap()));
+        s
+    }
+}
+
+/// Stats of one kind of packet over a stats interval
+#[derive(Debug, Default)]
+struct KindStats {
+    /// Packets that left the pacer
+    sent: u32,
+    /// How long they waited in the pacer
+    pacer_delay: DelaySamples,
+    /// RTX repairs: from the request to leaving the pacer
+    request_delay: DelaySamples,
+    /// Packets feedback reported on, and of those lost
+    reported: u32,
+    lost: u32,
+    /// One-way delay over the path's base, of those that arrived
+    network_delay: DelaySamples,
+}
+
+/// Stats gathered since `since`
+#[derive(Debug, Default)]
+struct Stats {
+    since: Option<Instant>,
+    kinds: [KindStats; 3],
+    /// Retransmissions dropped for waiting too long
+    rtx_dropped_stale: u32,
+    /// Retransmissions dropped for repeating one within the round-trip time
+    rtx_dropped_repeat: u32,
+}
+
+impl Stats {
+    fn kind(&mut self, kind: Kind) -> &mut KindStats {
+        &mut self.kinds[kind.index()]
+    }
+
+    /// The stats as an `RTPPacerStats` structure, starting over at `now`
+    fn take(
+        &mut self,
+        now: Instant,
+        bitrate: u32,
+        queued_bytes: u64,
+        rtx_dropped: u64,
+    ) -> gst::Structure {
+        let interval = self.since.map_or(Duration::ZERO, |since| now - since);
+        let mut s = gst::Structure::builder("RTPPacerStats")
+            .field("interval-ms", interval.as_millis() as u64)
+            .field("bitrate", bitrate)
+            .field("queued-bytes", queued_bytes);
+        for kind in Kind::ALL {
+            let name = kind.as_str();
+            let stats = self.kind(kind);
+            s = s
+                .field(format!("{name}-sent"), stats.sent)
+                .field(format!("{name}-reported"), stats.reported)
+                .field(format!("{name}-lost"), stats.lost);
+            s = stats
+                .pacer_delay
+                .add_fields(s, &format!("{name}-pacer-delay"));
+            s = stats
+                .request_delay
+                .add_fields(s, &format!("{name}-request-delay"));
+            s = stats
+                .network_delay
+                .add_fields(s, &format!("{name}-network-delay"));
+        }
+        let s = s
+            .field("rtx-dropped-stale", self.rtx_dropped_stale)
+            .field("rtx-dropped-repeat", self.rtx_dropped_repeat)
+            .field("rtx-dropped-total", rtx_dropped)
+            .build();
+        *self = Stats {
+            since: Some(now),
+            ..Default::default()
+        };
+        s
+    }
+}
+
+/// Lowest one-way delay (receiver clock minus sender clock, ns) over
+/// NETWORK_BASE_WINDOW_NS of send times
+#[derive(Debug, Default)]
+struct NetworkBase {
+    buckets: VecDeque<(i64, i64)>,
+}
+
+impl NetworkBase {
+    fn update(&mut self, send_ns: i64, owd: i64) {
+        match self.buckets.back_mut() {
+            Some((start, min)) if send_ns - *start < NETWORK_BASE_BUCKET_NS => {
+                *min = (*min).min(owd)
+            }
+            _ => self.buckets.push_back((send_ns, owd)),
+        }
+        while self
+            .buckets
+            .front()
+            .is_some_and(|(start, _)| send_ns - *start > NETWORK_BASE_WINDOW_NS)
+        {
+            self.buckets.pop_front();
+        }
+    }
+
+    fn get(&self) -> Option<i64> {
+        self.buckets.iter().map(|(_, min)| *min).min()
+    }
 }
 
 /// One packet of an `RTPTWCCPackets` event
@@ -335,6 +505,12 @@ struct State {
     rtx_sent: HashMap<(u32, u16), Instant>,
     /// Retransmissions dropped since start
     rtx_dropped: u64,
+    /// Stats of the current interval
+    stats: Stats,
+    /// Stats of the last complete interval
+    last_stats: Option<gst::Structure>,
+    /// Lowest one-way delay feedback reported lately
+    network_base: NetworkBase,
 
     /// Media streams by SSRC
     streams: Vec<MediaStream>,
@@ -383,6 +559,9 @@ impl Default for State {
             rtx_budget: 0.,
             rtx_sent: HashMap::new(),
             rtx_dropped: 0,
+            stats: Stats::default(),
+            last_stats: None,
+            network_base: NetworkBase::default(),
             streams: Vec::new(),
             frames: VecDeque::new(),
             next_frame_uid: 0,
@@ -489,15 +668,19 @@ impl State {
             frame: None,
             frame_start: false,
             osn: None,
+            requested_at: None,
         };
 
         if self.rtx_pts.contains(&pt) {
-            let requested = osn.is_some_and(|osn| {
+            // The latest request, if it asked again
+            info.requested_at = osn.and_then(|osn| {
                 self.rtx_requests
                     .iter()
-                    .any(|(seqnum, t)| *seqnum == osn && now - *t <= RTX_REQUEST_MAX_AGE)
+                    .rev()
+                    .find(|(seqnum, t)| *seqnum == osn && now - *t <= RTX_REQUEST_MAX_AGE)
+                    .map(|(_, t)| *t)
             });
-            info.kind = if requested {
+            info.kind = if info.requested_at.is_some() {
                 Kind::RtxRepair
             } else {
                 Kind::RtxPadding
@@ -814,6 +997,7 @@ impl State {
 
     /// The packets the budget allows sending now, and the events due
     fn dequeue(&mut self, element: &super::Pacer, now: Instant) -> Vec<Output> {
+        self.roll_stats(now);
         let elapsed = self.last_push.map_or(Duration::ZERO, |t| now - t);
         self.last_push = Some(now);
 
@@ -904,8 +1088,8 @@ impl State {
             let key = queued
                 .info
                 .and_then(|info| info.osn.map(|osn| (info.ssrc, osn)));
-            let drop_reason = if now.saturating_duration_since(queued.enqueued) > RTX_MAX_QUEUE_TIME
-            {
+            let stale = now.saturating_duration_since(queued.enqueued) > RTX_MAX_QUEUE_TIME;
+            let drop_reason = if stale {
                 Some("waited too long")
             } else if key
                 .and_then(|key| self.rtx_sent.get(&key))
@@ -920,6 +1104,11 @@ impl State {
                 let queued = self.rtx_queue.pop_front().unwrap();
                 self.queued_bytes -= queued.buffer.size() as u64;
                 self.rtx_dropped += 1;
+                if stale {
+                    self.stats.rtx_dropped_stale += 1;
+                } else {
+                    self.stats.rtx_dropped_repeat += 1;
+                }
                 gst::log!(
                     CAT,
                     obj = element,
@@ -976,11 +1165,24 @@ impl State {
             );
         }
 
+        let pacer_delay = now.saturating_duration_since(queued.enqueued);
+        if let Some(info) = queued.info {
+            let stats = self.stats.kind(info.kind);
+            stats.sent += 1;
+            stats.pacer_delay.push(pacer_delay);
+            if let Some(requested_at) = info.requested_at {
+                stats
+                    .request_delay
+                    .push(now.saturating_duration_since(requested_at));
+            }
+        }
+
         if let Some(info) = queued.info.filter(|info| info.has_extension) {
             self.sent.push_back(Sent {
                 index: self.next_index,
                 info,
                 at: now,
+                pacer_delay,
             });
             self.next_index += 1;
         }
@@ -990,6 +1192,22 @@ impl State {
 
     /// Forgets sent packets, frames and retransmission requests too old to
     /// matter for feedback or classification
+    /// Keeps the stats in `last_stats` once they span STATS_INTERVAL
+    fn roll_stats(&mut self, now: Instant) {
+        let Some(since) = self.stats.since else {
+            self.stats.since = Some(now);
+            return;
+        };
+        if now.saturating_duration_since(since) < STATS_INTERVAL {
+            return;
+        }
+        self.last_stats =
+            Some(
+                self.stats
+                    .take(now, self.bitrate, self.queued_bytes, self.rtx_dropped),
+            );
+    }
+
     fn prune(&mut self, now: Instant) {
         while self
             .sent
@@ -1078,6 +1296,36 @@ impl State {
             .min_by_key(|offset| (offset - expected).abs())
     }
 
+    /// Adds what feedback says about the packets the pacer can identify to
+    /// the stats: lost or not, and the one-way delay over the path's base
+    fn record_feedback(&mut self, packets: &[Feedback]) {
+        for fb in packets {
+            let owd = fb
+                .remote_ts
+                .map(|remote_ts| remote_ts as i64 - fb.local_ts as i64);
+            if let Some(owd) = owd {
+                self.network_base.update(fb.local_ts as i64, owd);
+            }
+            let Some(kind) = self
+                .offset
+                .and_then(|offset| self.sent_at(fb.seqnum - offset))
+                .map(|sent| sent.info)
+                .filter(|info| info.pt == fb.pt && info.payload_len == fb.size)
+                .map(|info| info.kind)
+            else {
+                continue;
+            };
+            let base = self.network_base.get();
+            let stats = self.stats.kind(kind);
+            stats.reported += 1;
+            if fb.lost {
+                stats.lost += 1;
+            } else if let (Some(owd), Some(base)) = (owd, base) {
+                stats.network_delay.push_ns(owd - base);
+            }
+        }
+    }
+
     /// Annotates the packets of an `RTPTWCCPackets` event with what the
     /// pacer knows about them
     fn on_feedback(
@@ -1127,14 +1375,16 @@ impl State {
             self.offset = offset;
         }
 
+        self.record_feedback(&packets);
+
         let annotated = packets
             .iter()
             .map(|fb| {
-                let info = self
+                let sent = self
                     .offset
                     .and_then(|offset| self.sent_at(fb.seqnum - offset))
-                    .map(|sent| sent.info)
-                    .filter(|info| info.pt == fb.pt && info.payload_len == fb.size);
+                    .filter(|sent| sent.info.pt == fb.pt && sent.info.payload_len == fb.size);
+                let info = sent.map(|sent| sent.info);
 
                 let mut s = gst::Structure::builder("RTPPacerPacket")
                     .field("twcc-seqnum", fb.seqnum)
@@ -1144,6 +1394,10 @@ impl State {
                     .field("payload-type", u32::from(fb.pt));
                 if let Some(remote_ts) = fb.remote_ts {
                     s = s.field("remote-ts", remote_ts);
+                }
+
+                if let Some(sent) = sent {
+                    s = s.field("pacer-delay", sent.pacer_delay.as_nanos() as u64);
                 }
 
                 s = match info {
@@ -1505,6 +1759,11 @@ impl ObjectImpl for Pacer {
                     .blurb("Retransmissions dropped for waiting too long or repeating one within the round-trip time")
                     .read_only()
                     .build(),
+                glib::ParamSpecBoxed::builder::<gst::Structure>("stats")
+                    .nick("Stats")
+                    .blurb("RTPPacerStats of the last second: per kind of packet (media, rtx-repair, rtx-padding), packets sent, reported and lost by feedback, and the mean, 95th percentile and max in microseconds of the time spent in the pacer, from the retransmission request (rtx-repair) and on the path over its lowest one-way delay; retransmissions dropped")
+                    .read_only()
+                    .build(),
                 glib::ParamSpecUInt64::builder("queued-bytes")
                     .nick("Queued Bytes")
                     .blurb("Bytes waiting in the pacer's queue")
@@ -1611,6 +1870,11 @@ impl ObjectImpl for Pacer {
             "rtt" => (state.rtt.as_nanos() as u64).to_value(),
             "rtx-dropped" => state.rtx_dropped.to_value(),
             "queued-bytes" => state.queued_bytes.to_value(),
+            "stats" => state
+                .last_stats
+                .clone()
+                .unwrap_or_else(|| gst::Structure::new_empty("RTPPacerStats"))
+                .to_value(),
             _ => unimplemented!(),
         }
     }
@@ -2104,8 +2368,10 @@ mod tests {
                     frame: None,
                     frame_start: false,
                     osn: None,
+                    requested_at: None,
                 },
                 at: now,
+                pacer_delay: Duration::ZERO,
             });
             state.next_index += 1;
         }
@@ -2125,6 +2391,101 @@ mod tests {
                 lost: false,
             })
             .collect()
+    }
+
+    #[test]
+    fn stats_track_pacer_and_request_delays() {
+        init();
+        let mut state = rtx_state();
+        let start = Instant::now();
+        state.last_push = Some(start);
+        // starts the stats interval
+        assert!(state.dequeue(&element(), start).is_empty());
+
+        let (mut seqnum, mut rtx_seqnum) = (0, 0);
+        frame_at(&mut state, &mut seqnum, 0, 3, 1000, false, start);
+        rtx_at(&mut state, &mut rtx_seqnum, &[1], start);
+        assert_eq!(
+            state
+                .dequeue(&element(), start + Duration::from_millis(50))
+                .len(),
+            4
+        );
+
+        // never given the chance to go out before going stale
+        rtx_at(
+            &mut state,
+            &mut rtx_seqnum,
+            &[2, 3],
+            start + Duration::from_millis(60),
+        );
+        state.dequeue(&element(), start + Duration::from_millis(400));
+        assert!(state.last_stats.is_none());
+
+        state.dequeue(
+            &element(),
+            start + STATS_INTERVAL + Duration::from_millis(1),
+        );
+        let stats = state.last_stats.clone().unwrap();
+        println!("{stats}");
+        assert_eq!(stats.get::<u32>("media-sent").unwrap(), 3);
+        assert_eq!(
+            stats.get::<i64>("media-pacer-delay-max-us").unwrap(),
+            50_000
+        );
+        assert_eq!(stats.get::<u32>("rtx-repair-sent").unwrap(), 1);
+        assert_eq!(
+            stats
+                .get::<i64>("rtx-repair-request-delay-mean-us")
+                .unwrap(),
+            50_000
+        );
+        assert_eq!(stats.get::<u32>("rtx-dropped-stale").unwrap(), 2);
+        assert_eq!(stats.get::<u32>("rtx-dropped-repeat").unwrap(), 0);
+        assert!(!stats.has_field("rtx-padding-pacer-delay-mean-us"));
+    }
+
+    #[test]
+    fn stats_track_the_queue_on_the_path() {
+        init();
+        let mut state = State::default();
+        sent(&mut state, &[1000, 1000, 1000, 1000]);
+        state.offset = Some(0);
+
+        // a receiver clock 1 s ahead, the path queuing 0, 5 and 30 ms, then
+        // a loss
+        let packets = [0, 5, 30]
+            .iter()
+            .enumerate()
+            .map(|(i, queue_ms)| {
+                let local_ts = i as u64 * 10_000_000;
+                Some(local_ts + 1_000_000_000 + queue_ms * 1_000_000)
+            })
+            .chain([None])
+            .enumerate()
+            .map(|(i, remote_ts)| Feedback {
+                seqnum: i as i64,
+                local_ts: i as u64 * 10_000_000,
+                remote_ts,
+                pt: 96,
+                size: 1000,
+                lost: remote_ts.is_none(),
+            })
+            .collect::<Vec<_>>();
+        state.record_feedback(&packets);
+
+        let stats = state.stats.take(Instant::now(), 0, 0, 0);
+        println!("{stats}");
+        assert_eq!(stats.get::<u32>("media-reported").unwrap(), 4);
+        assert_eq!(stats.get::<u32>("media-lost").unwrap(), 1);
+        assert_eq!(
+            stats.get::<i64>("media-network-delay-max-us").unwrap(),
+            30_000
+        );
+        assert_eq!(
+            stats.get::<i64>("media-network-delay-mean-us").unwrap(),
+            11_667
+        );
     }
 
     #[test]
