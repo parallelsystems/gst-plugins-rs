@@ -16,6 +16,34 @@ static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     )
 });
 
+/// The TWCC stats exposed by rtpsession cover a (hard-coded) 300ms window.
+/// Only act on them once per window, so that the same packets (e.g. one
+/// keyframe burst) don't drive several consecutive bitrate changes.
+const DELAY_CONTROL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How long the delay-based overuse signal must hold before the bitrate is
+/// decreased. A single large frame (keyframe) is spread out by any bottleneck
+/// and looks like overuse for as long as it stays in the stats window
+/// (~300ms); this must be longer than that for low framerate streams with
+/// short GOPs not to trigger a decrease on every keyframe.
+const OVERUSE_PERSISTENCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Multiplicative increase factor, applied once per DELAY_CONTROL_INTERVAL
+const DELAY_MULTIPLICATIVE_INCREASE: f64 = 1.06;
+
+/// Total arrival skew (receive duration - send duration) accumulated over
+/// the stats window above which the delay controller signals overuse,
+/// i.e. 10% of the 300ms window
+const MAX_WINDOW_SKEW_NS: i64 = 30_000_000;
+
+/// Time constant for the smoothing of the loss percentage. With few packets
+/// per stats window (low framerate / low bitrate), a single lost packet is
+/// worth several percents of loss, smoothing avoids overreacting to it.
+const LOSS_SMOOTHING_TIME_CONSTANT_S: f64 = 1.0;
+
+/// Framerate assumed when the actual one is unknown
+const DEFAULT_FRAMERATE: f64 = 30.;
+
 #[derive(Debug)]
 enum IncreaseType {
     /// Increase bitrate by value
@@ -87,6 +115,11 @@ pub struct CongestionController {
     /// Used in additive mode to track last control time, influences
     /// calculation of added value according to gcc section 5.5
     last_update_time: Option<std::time::Instant>,
+    /// When the delay-based overuse signal was first observed, reset
+    /// as soon as a sample shows no overuse
+    overuse_since: Option<std::time::Instant>,
+    /// Smoothed loss percentage and the time it was last updated
+    loss_pct_ema: Option<(f64, std::time::Instant)>,
     /// For logging purposes
     peer_id: String,
 
@@ -103,6 +136,8 @@ impl CongestionController {
             bitrate_ema: None,
             bitrate_emvar: 0.,
             last_update_time: None,
+            overuse_since: None,
+            loss_pct_ema: None,
             peer_id: peer_id.to_string(),
             min_bitrate,
             max_bitrate,
@@ -115,7 +150,8 @@ impl CongestionController {
         element: &super::BaseWebRTCSink,
         twcc_stats: &gst::StructureRef,
         rtt: f64,
-    ) -> CongestionControlOp {
+        framerate: f64,
+    ) -> Option<CongestionControlOp> {
         let target_bitrate = f64::min(
             self.target_bitrate_on_delay as f64,
             self.target_bitrate_on_loss as f64,
@@ -124,12 +160,24 @@ impl CongestionController {
         // break, which qualifies as programming error
         let bitrate_sent = twcc_stats.get::<u32>("bitrate-sent").unwrap();
         let bitrate_recv = twcc_stats.get::<u32>("bitrate-recv").unwrap();
+        let packets_sent = twcc_stats.get::<u32>("packets-sent").unwrap();
         let delta_of_delta = twcc_stats.get::<i64>("avg-delta-of-delta").unwrap();
 
         let sent_minus_received = bitrate_sent.saturating_sub(bitrate_recv);
 
-        let delay_factor = sent_minus_received as f64 / target_bitrate;
-        let last_update_time = self.last_update_time.replace(std::time::Instant::now());
+        // Relative to what was actually sent in the window rather than to the
+        // target: the sent bitrate is well above target whenever the window
+        // contains a keyframe, which would otherwise inflate the factor.
+        let delay_factor = if bitrate_sent > 0 {
+            sent_minus_received as f64 / bitrate_sent as f64
+        } else {
+            0.
+        };
+
+        // avg-delta-of-delta is a per-packet mean, which makes any fixed
+        // threshold on it depend on the packet rate. Consider the skew
+        // accumulated over the whole window instead.
+        let window_skew = delta_of_delta.saturating_mul(packets_sent as i64);
 
         gst::trace!(
             CAT,
@@ -139,21 +187,59 @@ impl CongestionController {
             twcc_stats
         );
 
-        if delay_factor > 0.1 {
-            let (factor, reason) = if delay_factor < 0.64 {
+        let overuse = if delay_factor > 0.1 {
+            Some(if delay_factor < 0.64 {
                 (0.96, format!("low delay factor {delay_factor}"))
             } else {
                 (
                     delay_factor.sqrt().sqrt().clamp(0.8, 0.96),
                     format!("High delay factor {delay_factor}"),
                 )
-            };
+            })
+        } else if window_skew > MAX_WINDOW_SKEW_NS {
+            Some((0.97, format!("High window skew: {window_skew}ns")))
+        } else {
+            None
+        };
 
-            CongestionControlOp::Decrease { factor, reason }
-        } else if delta_of_delta > 1_000_000 {
-            CongestionControlOp::Decrease {
-                factor: 0.97,
-                reason: format!("High delta: {delta_of_delta}"),
+        let now = std::time::Instant::now();
+
+        // Every sample is used to track how long overuse has been signaled,
+        // even those we won't act upon
+        if overuse.is_some() {
+            self.overuse_since.get_or_insert(now);
+        } else {
+            self.overuse_since = None;
+        }
+
+        if let Some(last_update_time) = self.last_update_time {
+            // Stats are polled on a 100ms timer, leave some slack for the
+            // timer's jitter so that we run on every third tick
+            if now.duration_since(last_update_time) + std::time::Duration::from_millis(20)
+                < DELAY_CONTROL_INTERVAL
+            {
+                return None;
+            }
+        }
+        let last_update_time = self.last_update_time.replace(now);
+
+        let op = if let Some((factor, reason)) = overuse {
+            let overuse_duration = self
+                .overuse_since
+                .map_or(std::time::Duration::ZERO, |since| now.duration_since(since));
+
+            if overuse_duration >= OVERUSE_PERSISTENCE {
+                CongestionControlOp::Decrease { factor, reason }
+            } else {
+                gst::trace!(
+                    CAT,
+                    obj = element,
+                    "consumer {}: overuse signaled for {:?} ({}), holding",
+                    self.peer_id,
+                    overuse_duration,
+                    reason
+                );
+                CongestionControlOp::Hold
             }
         } else {
             CongestionControlOp::Increase(if let Some(ema) = self.bitrate_ema {
@@ -181,7 +267,7 @@ impl CongestionController {
                         self.peer_id
                     );
                     /* Multiplicative increase */
-                    IncreaseType::Multiplicative(1.03)
+                    IncreaseType::Multiplicative(DELAY_MULTIPLICATIVE_INCREASE)
                 } else if target_bitrate > ema + 7. * bitrate_stdev {
                     gst::trace!(
                         CAT,
@@ -194,22 +280,20 @@ impl CongestionController {
                      * multiplicative increase
                      */
                     self.bitrate_ema.take();
-                    IncreaseType::Multiplicative(1.03)
+                    IncreaseType::Multiplicative(DELAY_MULTIPLICATIVE_INCREASE)
                 } else {
                     let rtt_ms = rtt * 1000.;
                     let response_time_ms = 100. + rtt_ms;
                     let time_since_last_update_ms = match last_update_time {
                         None => 0.,
-                        Some(instant) => {
-                            (self.last_update_time.unwrap() - instant).as_millis() as f64
-                        }
+                        Some(instant) => now.duration_since(instant).as_millis() as f64,
                     };
                     // gcc section 5.5 advises 0.95 as the smoothing factor, but that
                     // seems intuitively much too low, granting disproportionate importance
                     // to the last measurement. 0.5 seems plenty enough, I don't have maths
                     // to back that up though :)
                     let alpha = 0.5 * f64::min(time_since_last_update_ms / response_time_ms, 1.0);
-                    let bits_per_frame = target_bitrate / 30.;
+                    let bits_per_frame = target_bitrate / framerate;
                     let packets_per_frame = f64::ceil(bits_per_frame / (1200. * 8.));
                     let avg_packet_size_bits = bits_per_frame / packets_per_frame;
 
@@ -231,9 +315,11 @@ impl CongestionController {
                     "consumer {}: outside congestion window",
                     self.peer_id
                 );
-                IncreaseType::Multiplicative(1.03)
+                IncreaseType::Multiplicative(DELAY_MULTIPLICATIVE_INCREASE)
             })
-        }
+        };
+
+        Some(op)
     }
 
     fn clamp_bitrate(&mut self, bitrate: i32, n_encoders: i32, controller_type: ControllerType) {
@@ -297,7 +383,32 @@ impl CongestionController {
         stats: &gst::StructureRef,
         encoders: &mut [VideoEncoder],
     ) {
-        let loss_percentage = stats.get::<f64>("packet-loss-pct").unwrap();
+        let raw_loss_percentage = stats.get::<f64>("packet-loss-pct").unwrap();
+
+        // No packet in the window (0 / 0), nothing to learn from it
+        if !raw_loss_percentage.is_finite() {
+            return;
+        }
+
+        // Time-weighted exponential smoothing: feedbacks don't come at a
+        // fixed rate and each covers an overlapping 300ms window.
+        let now = std::time::Instant::now();
+        let loss_percentage = match self.loss_pct_ema {
+            Some((ema, last)) => {
+                let dt = now.duration_since(last).as_secs_f64();
+                let alpha = 1. - f64::exp(-dt / LOSS_SMOOTHING_TIME_CONSTANT_S);
+                ema + alpha * (raw_loss_percentage - ema)
+            }
+            None => raw_loss_percentage,
+        };
+        self.loss_pct_ema = Some((loss_percentage, now));
+
+        gst::trace!(
+            CAT,
+            obj = element,
+            "consumer {}: loss {raw_loss_percentage}%, smoothed {loss_percentage}%",
+            self.peer_id,
+        );
 
         self.apply_control_op(
             element,
@@ -323,8 +434,16 @@ impl CongestionController {
         encoders: &mut [VideoEncoder],
     ) {
         if let Some(twcc_stats) = lookup_twcc_stats(stats) {
-            let op = self.update_delay(element, &twcc_stats, self.lookup_rtt(stats));
-            self.apply_control_op(element, encoders, op, ControllerType::Delay);
+            let framerate = encoders
+                .first()
+                .and_then(|encoder| encoder.framerate())
+                .unwrap_or(DEFAULT_FRAMERATE);
+            let rtt = self.lookup_rtt(stats);
+
+            // None when it is too early to act on the stats again
+            if let Some(op) = self.update_delay(element, &twcc_stats, rtt, framerate) {
+                self.apply_control_op(element, encoders, op, ControllerType::Delay);
+            }
         }
     }
 

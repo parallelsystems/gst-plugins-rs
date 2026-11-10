@@ -925,6 +925,16 @@ impl VideoEncoder {
         (width + 1) & !1
     }
 
+    /// Framerate of the stream fed to this encoder, if known and fixed
+    pub(crate) fn framerate(&self) -> Option<f64> {
+        let fps = self.video_info.fps();
+        if fps.numer() > 0 && fps.denom() > 0 {
+            Some(fps.numer() as f64 / fps.denom() as f64)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn set_bitrate(
         &mut self,
         element: &super::BaseWebRTCSink,
