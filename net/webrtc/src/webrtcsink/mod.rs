@@ -37,9 +37,9 @@ use gst::prelude::*;
 use gst::subclass::prelude::*;
 
 mod homegrown_cc;
+mod homegrown_cc_ng;
 
 mod imp;
-mod packet_feedback;
 mod pad;
 
 glib::wrapper! {
@@ -139,6 +139,11 @@ pub enum WebRTCSinkCongestionControl {
     Homegrown,
     #[enum_value(name = "Google Congestion Control algorithm", nick = "gcc")]
     GoogleCongestionControl,
+    #[enum_value(
+        name = "Homegrown NG: homegrown heuristic paced through rtppacer, on per-packet feedback",
+        nick = "homegrown-ng"
+    )]
+    HomegrownNG,
 }
 
 #[glib::flags(name = "GstWebRTCSinkMitigationMode")]

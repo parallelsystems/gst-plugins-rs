@@ -20,13 +20,88 @@ use std::ops::DerefMut;
 use std::ops::Mul;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
-use super::homegrown_cc::CongestionController;
+use super::{homegrown_cc, homegrown_cc_ng};
 use super::{
     WebRTCSinkCongestionControl, WebRTCSinkError, WebRTCSinkMitigationMode, WebRTCSinkPad,
 };
 use crate::signaller::{prelude::*, Signallable, Signaller, WebRTCSignallerRole};
 use crate::{utils, RUNTIME};
 use std::collections::{BTreeMap, HashSet};
+
+/// The homegrown congestion controller a session runs
+enum HomegrownController {
+    /// `WebRTCSinkCongestionControl::Homegrown`: on the aggregate TWCC stats
+    Classic(homegrown_cc::CongestionController),
+    /// `WebRTCSinkCongestionControl::HomegrownNG`: paced through `rtppacer`,
+    /// on its per-packet feedback. Boxed, it's several times the size.
+    Ng(Box<homegrown_cc_ng::CongestionController>),
+}
+
+impl HomegrownController {
+    /// Starts both targets from the bitrates the encoders start at
+    fn add_encoder_bitrate(&mut self, bitrate: i32) {
+        match self {
+            Self::Classic(cc) => {
+                cc.target_bitrate_on_delay += bitrate;
+                cc.target_bitrate_on_loss = cc.target_bitrate_on_delay;
+            }
+            Self::Ng(cc) => {
+                cc.target_bitrate_on_delay += bitrate;
+                cc.target_bitrate_on_loss = cc.target_bitrate_on_delay;
+            }
+        }
+    }
+
+    fn encoders_changed(&self, encoders: &[VideoEncoder]) {
+        if let Self::Ng(cc) = self {
+            cc.encoders_changed(encoders);
+        }
+    }
+
+    fn loss_control(
+        &mut self,
+        element: &super::BaseWebRTCSink,
+        stats: &gst::StructureRef,
+        encoders: &mut [VideoEncoder],
+    ) {
+        match self {
+            Self::Classic(cc) => cc.loss_control(element, stats, encoders),
+            Self::Ng(cc) => cc.loss_control(element, stats, encoders),
+        }
+    }
+
+    fn delay_control(
+        &mut self,
+        element: &super::BaseWebRTCSink,
+        stats: &gst::StructureRef,
+        encoders: &mut [VideoEncoder],
+    ) {
+        match self {
+            Self::Classic(cc) => cc.delay_control(element, stats, encoders),
+            Self::Ng(cc) => cc.delay_control(element, stats, encoders),
+        }
+    }
+
+    #[cfg(feature = "v1_22")]
+    fn packet_feedback(
+        &mut self,
+        element: &super::BaseWebRTCSink,
+        feedback: &gst::StructureRef,
+        encoders: &mut [VideoEncoder],
+    ) {
+        if let Self::Ng(cc) = self {
+            cc.packet_feedback(element, feedback, encoders);
+        }
+    }
+
+    /// The `rtppacer` the NG controller paces through, if any
+    fn pacer(&self) -> Option<&gst::Element> {
+        match self {
+            Self::Classic(_) => None,
+            Self::Ng(cc) => cc.pacer(),
+        }
+    }
+}
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
@@ -272,8 +347,8 @@ struct SessionInner {
     peer_id: String,
     encoders: Vec<VideoEncoder>,
 
-    // Our Homegrown controller (if cc_info.heuristic == Homegrown)
-    congestion_controller: Option<CongestionController>,
+    // Our Homegrown controller (if cc_info.heuristic == Homegrown or HomegrownNG)
+    congestion_controller: Option<HomegrownController>,
     // Our BandwidthEstimator (if cc_info.heuristic == GoogleCongestionControl)
     rtpgccbwe: Option<gst::Element>,
 
@@ -1233,7 +1308,7 @@ impl SessionInner {
         pipeline: gst::Pipeline,
         webrtcbin: gst::Element,
         peer_id: String,
-        congestion_controller: Option<CongestionController>,
+        congestion_controller: Option<HomegrownController>,
         rtpgccbwe: Option<gst::Element>,
         cc_info: CCInfo,
     ) -> Self {
@@ -1274,11 +1349,11 @@ impl SessionInner {
             .build();
 
         // The pacer's RTPPacerStats of the last second, with the homegrown
-        // congestion controller
+        // NG congestion controller
         if let Some(pacer) = self
             .congestion_controller
             .as_ref()
-            .and_then(CongestionController::pacer)
+            .and_then(HomegrownController::pacer)
             .filter(|pacer| pacer.find_property("stats").is_some())
         {
             our_stats.set("pacer", pacer.property::<gst::Structure>("stats"));
@@ -1451,12 +1526,11 @@ impl SessionInner {
                         let _ = enc.set_bitrate(element, self.cc_info.max_bitrate as i32);
                         enc.transceiver.set_property("fec-percentage", 20u32);
                     }
-                    WebRTCSinkCongestionControl::Homegrown => {
+                    WebRTCSinkCongestionControl::Homegrown
+                    | WebRTCSinkCongestionControl::HomegrownNG => {
                         if let Some(congestion_controller) = self.congestion_controller.as_mut() {
                             if let Ok(bitrate) = enc.bitrate() {
-                                congestion_controller.target_bitrate_on_delay += bitrate;
-                                congestion_controller.target_bitrate_on_loss =
-                                    congestion_controller.target_bitrate_on_delay;
+                                congestion_controller.add_encoder_bitrate(bitrate);
                                 enc.transceiver.set_property("fec-percentage", 0u32);
                             }
                         } else {
@@ -2762,11 +2836,11 @@ impl BaseWebRTCSink {
             _ => None,
         };
 
-        // The homegrown controller paces through rtppacer, which also gives
-        // it the per-packet feedback it runs on
+        // The homegrown NG controller paces through rtppacer, which also
+        // gives it the per-packet feedback it runs on
         #[cfg(feature = "v1_22")]
         let pacer = match settings.cc_info.heuristic {
-            WebRTCSinkCongestionControl::Homegrown => {
+            WebRTCSinkCongestionControl::HomegrownNG => {
                 match gst::ElementFactory::make("rtppacer")
                     .property("bitrate", settings.cc_info.start_bitrate.max(1))
                     .build()
@@ -2775,7 +2849,7 @@ impl BaseWebRTCSink {
                         gst::warning!(
                             CAT,
                             imp = self,
-                            "The `rtppacer` element is not available, the homegrown \
+                            "The `rtppacer` element is not available, the homegrown NG \
                             congestion controller runs unpaced on aggregate stats: {err:?}"
                         );
                         None
@@ -2991,12 +3065,22 @@ impl BaseWebRTCSink {
             webrtcbin.clone(),
             peer_id.clone(),
             match settings.cc_info.heuristic {
-                WebRTCSinkCongestionControl::Homegrown => Some(CongestionController::new(
-                    &peer_id,
-                    settings.cc_info.min_bitrate,
-                    settings.cc_info.max_bitrate,
-                    settings.do_fec,
-                    pacer,
+                WebRTCSinkCongestionControl::Homegrown => Some(HomegrownController::Classic(
+                    homegrown_cc::CongestionController::new(
+                        &peer_id,
+                        settings.cc_info.min_bitrate,
+                        settings.cc_info.max_bitrate,
+                        settings.do_fec,
+                    ),
+                )),
+                WebRTCSinkCongestionControl::HomegrownNG => Some(HomegrownController::Ng(
+                    Box::new(homegrown_cc_ng::CongestionController::new(
+                        &peer_id,
+                        settings.cc_info.min_bitrate,
+                        settings.cc_info.max_bitrate,
+                        settings.do_fec,
+                        pacer,
+                    )),
                 )),
                 _ => None,
             },
@@ -3292,7 +3376,7 @@ impl BaseWebRTCSink {
         Ok(())
     }
 
-    /// Runs the homegrown controller on the pacer's per-packet feedback
+    /// Runs the homegrown NG controller on the pacer's per-packet feedback
     #[cfg(feature = "v1_22")]
     fn process_packet_feedback(&self, session_id: &str, feedback: &gst::Structure) {
         let mut state = self.state.lock().unwrap();
@@ -4581,8 +4665,8 @@ impl ObjectImpl for BaseWebRTCSink {
                  * @overall bitrate target
                  *
                  * This signal is emitted when the congestion controller updates
-                 * its target bitrates: by the homegrown `CongestionController`,
-                 * and with `google-congestion-control` whenever rtpgccbwe's
+                 * its target bitrates: by the `homegrown` and `homegrown-ng`
+                 * controllers, and with `google-congestion-control` whenever rtpgccbwe's
                  * estimate changes, in which case the overall target is the
                  * bitrate given to each encoder (after FEC overhead). All
                  * bitrates are in bps.
@@ -4596,8 +4680,8 @@ impl ObjectImpl for BaseWebRTCSink {
                  * @capacity-lower-bound: rate the link recently carried at least, in bps
                  * @queue-delay: smoothed queuing delay of delta frames, in ns
                  *
-                 * This signal is emitted by the homegrown `CongestionController`
-                 * running on the pacer's per-packet feedback, whenever one of its
+                 * This signal is emitted by the `homegrown-ng` congestion
+                 * controller running on the pacer's per-packet feedback, whenever one of its
                  * detector's signals changes. A value is 0 while it is unknown:
                  * not measured yet, or stale.
                  */
