@@ -202,8 +202,6 @@ pub(crate) struct Signals {
     /// Bottleneck capacity measured from bursts it spread out, bit/sec.
     /// None until measured, or once stale.
     pub capacity: Option<f64>,
-    /// This feedback added a sample to the capacity
-    pub capacity_sampled: bool,
     /// Rate the link recently carried at least, from bursts the pacer
     /// spread out, bit/sec
     pub capacity_lower_bound: Option<f64>,
@@ -426,15 +424,12 @@ struct Capacity {
     measured_at: Option<i64>,
     /// Highest recent pacer-limited sample, bit/sec, and when it was taken
     lower_bound: Option<(f64, i64)>,
-    /// Bottleneck-limited samples taken so far
-    taken: u64,
 }
 
 impl Capacity {
     /// Adds a sample from a drain the bottleneck spread out. Returns whether
     /// it replaced the estimate, being well below it or the estimate stale.
     fn add_measurement(&mut self, sample: f64, at: i64) -> bool {
-        self.taken += 1;
         let replace = self
             .measured(at)
             .map_or(true, |capacity| sample < CAPACITY_DROP_RATIO * capacity);
@@ -447,12 +442,6 @@ impl Capacity {
         }
         self.measured_at = Some(at);
         replace
-    }
-
-    /// Drops the measured capacity, keeping the lower bound
-    fn forget(&mut self) {
-        self.samples.clear();
-        self.measured_at = None;
     }
 
     /// Adds a sample from a drain the pacer spread out
@@ -517,17 +506,9 @@ impl PacketDetector {
         self.capacity.lower_bound(self.now_ns)
     }
 
-    /// Drops the measured capacity, keeping the lower bound: the controller
-    /// found the link carrying more than it says. The next drain the
-    /// bottleneck spreads out measures it again.
-    pub fn forget_capacity(&mut self) {
-        self.capacity.forget();
-    }
-
     /// Processes the packets of one feedback, in TWCC order
     pub fn update(&mut self, packets: &[FeedbackPacket]) -> Signals {
         let mut signals = Signals::default();
-        let samples_before = self.capacity.taken;
 
         if let (Some(first), Some(last)) = (
             packets.iter().map(|p| p.send_ns).min(),
@@ -684,7 +665,6 @@ impl PacketDetector {
             .queue_delay_ns
             .map(|ns| Duration::from_nanos(ns.max(0.) as u64));
         signals.capacity = self.capacity.measured(self.now_ns);
-        signals.capacity_sampled = self.capacity.taken != samples_before;
         signals.capacity_lower_bound = self.capacity.lower_bound(self.now_ns);
         signals
     }
@@ -905,22 +885,6 @@ mod tests {
         assert_eq!(capacity.measured(5000 * MS), Some(2e6));
         // and it goes stale without new samples
         assert_eq!(capacity.measured(5000 * MS + CAPACITY_MAX_AGE_NS + 1), None);
-    }
-
-    #[test]
-    fn forgetting_the_capacity_keeps_the_lower_bound() {
-        let mut capacity = Capacity::default();
-        capacity.add_lower_bound(2.2e6, 0);
-        capacity.add_measurement(2e6, 0);
-        capacity.add_measurement(2.1e6, 500 * MS);
-        assert_eq!(capacity.taken, 2);
-        capacity.forget();
-        assert_eq!(capacity.measured(1000 * MS), None);
-        assert_eq!(capacity.lower_bound(1000 * MS), Some(2.2e6));
-        // the next sample is the estimate on its own
-        capacity.add_measurement(5e6, 2000 * MS);
-        assert_eq!(capacity.measured(2000 * MS), Some(5e6));
-        assert_eq!(capacity.taken, 3);
     }
 
     #[test]

@@ -144,26 +144,6 @@ const CAPACITY_TARGET_RATIO: f64 = 0.9;
 /// Above this fraction of the measured capacity, increases are additive
 const CAPACITY_ADDITIVE_RATIO: f64 = 0.8;
 
-/// The delay target counts as held at the capacity ceiling from this
-/// fraction of it (increases stop just short of it, in whole bits)
-const CEILING_REACHED_RATIO: f64 = 0.99;
-
-/// The capacity estimate is dropped once the delay target has been held at
-/// its ceiling this long with the queue at or below QUEUE_DELAY_NORMAL: the
-/// link carries everything without queuing, so it's faster than the
-/// estimate, and nothing measures it again until a queue builds. Doubled
-/// each time a probe finds the estimate was right, up to the max...
-const MIN_CEILING_PROBE_AFTER: Duration = Duration::from_secs(3);
-const MAX_CEILING_PROBE_AFTER: Duration = Duration::from_secs(30);
-
-/// ... which is when the probe's first capacity sample is at most this
-/// many times the dropped estimate...
-const PROBE_CONFIRMED_RATIO: f64 = 1.1;
-
-/// ... and back to the min when it, or the delay target without congestion,
-/// gets past this many times the dropped estimate: the link got faster
-const PROBE_FASTER_RATIO: f64 = 1.2;
-
 /// Delta frame packets the loss controller waits for, across feedbacks,
 /// before deciding on their loss
 const MIN_LOSS_PACKETS: usize = 10;
@@ -232,8 +212,6 @@ fn limit_increase(increase: IncreaseType, current: f64, ceiling: f64) -> Increas
 struct CongestionEpisode {
     /// The controller's target just before the episode's first decrease
     pre_bitrate: Option<f64>,
-    /// When the episode's first decrease happened
-    started: Option<Instant>,
     /// When the episode's most recent decrease happened
     last_decrease: Option<Instant>,
     /// Fast recovery is underway
@@ -259,7 +237,6 @@ impl CongestionEpisode {
         } else if !ongoing {
             *self = Self {
                 pre_bitrate: Some(bitrate),
-                started: Some(now),
                 ..Default::default()
             };
         }
@@ -307,94 +284,6 @@ impl CongestionEpisode {
             goal / bitrate,
         );
         Some((IncreaseType::FastRecovery(factor), starting))
-    }
-
-    /// Whether a capacity estimate last sampled at `sampled_at` was measured
-    /// during this episode: it measured the drop, which fast recovery is
-    /// betting was short, so it doesn't hold fast recovery back
-    fn measured(&self, sampled_at: Option<Instant>) -> bool {
-        self.started
-            .zip(sampled_at)
-            .is_some_and(|(started, sampled_at)| sampled_at >= started)
-    }
-}
-
-/// What a probe past the capacity ceiling found
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ProbeVerdict {
-    /// The link was where the estimate said
-    Confirmed,
-    /// The link got faster than the estimate
-    Faster,
-}
-
-/// Drops a capacity estimate the link has outgrown, and probes less often
-/// while the probes keep finding it right. The estimate only gets measured
-/// when a queue builds, so while increases stop short of it nothing tells
-/// it's stale: after a drop that turned out short it otherwise held the
-/// target down until it aged out, 30 s later (hitl1116).
-#[derive(Debug)]
-struct CeilingProbe {
-    /// Since when the delay target has been held at the ceiling with the
-    /// queue at or below QUEUE_DELAY_NORMAL
-    at_ceiling_since: Option<Instant>,
-    /// How long that takes to drop the estimate
-    probe_after: Duration,
-    /// The estimate dropped by the probe underway
-    dropped: Option<f64>,
-}
-
-impl Default for CeilingProbe {
-    fn default() -> Self {
-        Self {
-            at_ceiling_since: None,
-            probe_after: MIN_CEILING_PROBE_AFTER,
-            dropped: None,
-        }
-    }
-}
-
-impl CeilingProbe {
-    /// The delay target is held at the ceiling of `capacity` with the queue
-    /// at or below QUEUE_DELAY_NORMAL. Returns whether to drop the estimate.
-    fn at_ceiling(&mut self, now: Instant, capacity: f64) -> bool {
-        let since = *self.at_ceiling_since.get_or_insert(now);
-        if now.duration_since(since) < self.probe_after {
-            return false;
-        }
-        self.at_ceiling_since = None;
-        self.dropped = Some(capacity);
-        true
-    }
-
-    /// The target is below the ceiling, or the queue above normal
-    fn not_at_ceiling(&mut self) {
-        self.at_ceiling_since = None;
-    }
-
-    /// A capacity sample came in, `capacity` the estimate it made
-    fn on_sample(&mut self, capacity: f64) -> Option<ProbeVerdict> {
-        let dropped = self.dropped.take()?;
-        if capacity <= PROBE_CONFIRMED_RATIO * dropped {
-            self.probe_after = (2 * self.probe_after).min(MAX_CEILING_PROBE_AFTER);
-            Some(ProbeVerdict::Confirmed)
-        } else if capacity >= PROBE_FASTER_RATIO * dropped {
-            self.probe_after = MIN_CEILING_PROBE_AFTER;
-            Some(ProbeVerdict::Faster)
-        } else {
-            None
-        }
-    }
-
-    /// The delay target got to `target` while probing
-    fn on_target(&mut self, target: f64) -> Option<ProbeVerdict> {
-        let dropped = self.dropped?;
-        if target < PROBE_FASTER_RATIO * dropped {
-            return None;
-        }
-        self.dropped = None;
-        self.probe_after = MIN_CEILING_PROBE_AFTER;
-        Some(ProbeVerdict::Faster)
     }
 }
 
@@ -565,10 +454,6 @@ pub struct CongestionController {
     pacer: Option<gst::Element>,
     /// Congestion signals from the per-packet feedback
     detector: PacketDetector,
-    /// When the detector last took a capacity sample
-    capacity_sampled_at: Option<Instant>,
-    /// Drops a capacity ceiling the link has outgrown
-    ceiling_probe: CeilingProbe,
     /// Last time per-packet feedback came in
     last_packet_feedback: Option<Instant>,
     /// Whether the controller ran on per-packet feedback last time it
@@ -618,8 +503,6 @@ impl CongestionController {
             delay_signals: DelaySignals::default(),
             pacer,
             detector: PacketDetector::default(),
-            capacity_sampled_at: None,
-            ceiling_probe: CeilingProbe::default(),
             last_packet_feedback: None,
             on_packet_feedback: false,
             emitted_detector: None,
@@ -756,10 +639,7 @@ impl CongestionController {
     /// congestion episode, for fast recovery. With a `capacity`, increases
     /// turn additive at CAPACITY_ADDITIVE_RATIO of it and stop at
     /// CAPACITY_TARGET_RATIO: the link is known, no need to find it by
-    /// overflowing its buffer. Unless the target sits at that ceiling long
-    /// enough with the queue empty for the estimate to look stale (see
-    /// CeilingProbe), or fast recovery climbs back from the drop the
-    /// estimate measured.
+    /// overflowing its buffer.
     #[allow(clippy::too_many_arguments)]
     fn delay_increase(
         &mut self,
@@ -772,34 +652,12 @@ impl CongestionController {
         encoders: &[VideoEncoder],
     ) -> CongestionControlOp {
         let Some(capacity) = capacity else {
-            self.ceiling_probe.not_at_ceiling();
             return self.window_increase(element, now, interval_secs, rtt, recovered, encoders);
         };
 
         let current = self.target_bitrate_on_delay as f64;
         let ceiling = CAPACITY_TARGET_RATIO * capacity;
-        if current >= CEILING_REACHED_RATIO * ceiling {
-            // Only called with the queue at or below QUEUE_DELAY_NORMAL
-            if self.ceiling_probe.at_ceiling(now, capacity) {
-                gst::info!(
-                    CAT,
-                    obj = element,
-                    "consumer {}: delay target {:.0} held at the ceiling of capacity {:.0} \
-                     with no queue for {:?}, dropping the estimate to probe past it",
-                    self.peer_id,
-                    current,
-                    capacity,
-                    self.ceiling_probe.probe_after,
-                );
-                self.detector.forget_capacity();
-                return self.window_increase(element, now, interval_secs, rtt, recovered, encoders);
-            }
-        } else {
-            self.ceiling_probe.not_at_ceiling();
-        }
-
-        let episode_estimate = self.delay_episode.measured(self.capacity_sampled_at);
-        if current >= ceiling && !episode_estimate {
+        if current >= ceiling {
             gst::trace!(
                 CAT,
                 obj = element,
@@ -815,19 +673,6 @@ impl CongestionController {
         let near_capacity = current >= CAPACITY_ADDITIVE_RATIO * capacity;
         let increase =
             match self.window_increase(element, now, interval_secs, rtt, recovered, encoders) {
-                CongestionControlOp::Increase(IncreaseType::FastRecovery(factor))
-                    if episode_estimate =>
-                {
-                    gst::trace!(
-                        CAT,
-                        obj = element,
-                        "consumer {}: fast recovery past capacity {:.0}, measured during the drop",
-                        self.peer_id,
-                        capacity,
-                    );
-                    return CongestionControlOp::Increase(IncreaseType::FastRecovery(factor));
-                }
-                _ if current >= ceiling => return CongestionControlOp::Hold,
                 CongestionControlOp::Increase(IncreaseType::Multiplicative(_)) if near_capacity => {
                     gst::trace!(
                         CAT,
@@ -1221,15 +1066,6 @@ impl CongestionController {
 
         let signals = self.detector.update(&packets);
         self.emit_detector_changed(element, &signals);
-        if signals.capacity_sampled {
-            self.capacity_sampled_at = Some(now);
-            if let Some(verdict) = signals
-                .capacity
-                .and_then(|capacity| self.ceiling_probe.on_sample(capacity))
-            {
-                self.log_probe_verdict(element, verdict, signals.capacity);
-            }
-        }
         if signals.send_span_ns > 0 {
             let rtx_rate = signals.rtx_bits as f64 / (signals.send_span_ns as f64 / 1e9);
             self.rtx_rate += RTX_RATE_ALPHA * (rtx_rate - self.rtx_rate);
@@ -1266,12 +1102,6 @@ impl CongestionController {
 
         let op = self.packet_delay_op(element, &signals, now, encoders);
         self.apply_control_op(element, encoders, op, ControllerType::Delay);
-        if let Some(verdict) = self
-            .ceiling_probe
-            .on_target(self.target_bitrate_on_delay as f64)
-        {
-            self.log_probe_verdict(element, verdict, None);
-        }
 
         // At low bitrates a feedback can hold only a packet or two
         self.delta_packets += signals.delta_packets;
@@ -1293,31 +1123,6 @@ impl CongestionController {
             let op = self.loss_op(element, loss_percentage);
             self.apply_control_op(element, encoders, op, ControllerType::Loss);
         }
-    }
-
-    /// Logs what a probe past the capacity ceiling found, and when the next
-    /// one may happen
-    fn log_probe_verdict(
-        &self,
-        element: &super::BaseWebRTCSink,
-        verdict: ProbeVerdict,
-        capacity: Option<f64>,
-    ) {
-        gst::info!(
-            CAT,
-            obj = element,
-            "consumer {}: probe past the capacity ceiling: {}, next probe after {:?} at the ceiling",
-            self.peer_id,
-            match (verdict, capacity) {
-                (ProbeVerdict::Confirmed, _) => format!("link still at {capacity:.0?}"),
-                (ProbeVerdict::Faster, Some(capacity)) => format!("link got faster, {capacity:.0}"),
-                (ProbeVerdict::Faster, None) => format!(
-                    "delay target {} past the dropped estimate without congestion",
-                    self.target_bitrate_on_delay
-                ),
-            },
-            self.ceiling_probe.probe_after,
-        );
     }
 
     /// Emits `cc-detector-changed` if the capacity, its lower bound or the
@@ -1377,7 +1182,6 @@ impl CongestionController {
             .is_some_and(|t| now.duration_since(t).as_secs_f64() < settle);
 
         if signals.drain_overrun || queue_delay > QUEUE_DELAY_OVERUSE {
-            self.ceiling_probe.not_at_ceiling();
             if settling {
                 gst::debug!(
                     CAT,
@@ -1447,7 +1251,6 @@ impl CongestionController {
             self.queue_at_cut = None;
         }
         if settling || queue_delay > QUEUE_DELAY_NORMAL {
-            self.ceiling_probe.not_at_ceiling();
             gst::trace!(
                 CAT,
                 obj = element,
@@ -1808,93 +1611,6 @@ mod tests {
         assert!(e
             .recovery_increase(t + Duration::from_secs(2), 2_200_000., true, 0.1)
             .is_none());
-    }
-
-    #[test]
-    fn ceiling_is_dropped_after_holding_with_no_queue() {
-        // hitl1116 at 22:30:14: 1,948 kbps held at 0.9 x 2,165 kbps on a
-        // 6 Mbps link with a 3-5 ms queue
-        let t0 = Instant::now();
-        let s = Duration::from_secs;
-        let mut probe = CeilingProbe::default();
-        assert!(!probe.at_ceiling(t0, 2.165e6));
-        assert!(!probe.at_ceiling(t0 + s(2), 2.165e6));
-        // a queue building restarts the wait
-        probe.not_at_ceiling();
-        assert!(!probe.at_ceiling(t0 + s(3), 2.165e6));
-        assert!(probe.at_ceiling(t0 + s(6), 2.165e6));
-        assert_eq!(probe.dropped, Some(2.165e6));
-        // and the next probe waits again
-        assert!(!probe.at_ceiling(t0 + s(7), 2.165e6));
-    }
-
-    #[test]
-    fn confirmed_probes_back_off() {
-        let t0 = Instant::now();
-        let mut probe = CeilingProbe::default();
-        let mut waits = vec![];
-        for _ in 0..6 {
-            probe.dropped = Some(2e6);
-            assert_eq!(probe.on_sample(2.1e6), Some(ProbeVerdict::Confirmed));
-            waits.push(probe.probe_after.as_secs());
-        }
-        assert_eq!(waits, [6, 12, 24, 30, 30, 30]);
-        // a probe takes the backed off wait
-        assert!(!probe.at_ceiling(t0, 2e6));
-        assert!(!probe.at_ceiling(t0 + Duration::from_secs(29), 2e6));
-        assert!(probe.at_ceiling(t0 + MAX_CEILING_PROBE_AFTER, 2e6));
-        // a sample a bit lower confirms it too
-        assert_eq!(probe.on_sample(1.7e6), Some(ProbeVerdict::Confirmed));
-        // with no probe underway samples say nothing
-        assert_eq!(probe.on_sample(9e6), None);
-    }
-
-    #[test]
-    fn faster_link_resets_the_wait() {
-        let mut probe = CeilingProbe {
-            probe_after: Duration::from_secs(24),
-            dropped: Some(2e6),
-            ..Default::default()
-        };
-        assert_eq!(probe.on_sample(2.5e6), Some(ProbeVerdict::Faster));
-        assert_eq!(probe.probe_after, MIN_CEILING_PROBE_AFTER);
-
-        // or the target getting well past it without congestion
-        probe.probe_after = Duration::from_secs(24);
-        probe.dropped = Some(2e6);
-        assert_eq!(probe.on_target(2.3e6), None);
-        assert_eq!(probe.on_target(2.4e6), Some(ProbeVerdict::Faster));
-        assert_eq!(probe.probe_after, MIN_CEILING_PROBE_AFTER);
-        assert_eq!(probe.dropped, None);
-
-        // in between: no verdict, the wait stays
-        probe.probe_after = Duration::from_secs(12);
-        probe.dropped = Some(2e6);
-        assert_eq!(probe.on_sample(2.3e6), None);
-        assert_eq!(probe.probe_after, Duration::from_secs(12));
-        assert_eq!(probe.dropped, None);
-    }
-
-    #[test]
-    fn fast_recovery_ignores_estimates_from_its_own_drop() {
-        let t0 = Instant::now();
-        let s = Duration::from_secs;
-        let mut e = CongestionEpisode::default();
-        assert!(!e.measured(Some(t0)));
-        e.on_decrease(t0 + s(1), 3_000_000.);
-        // measured before the drop: still the link's
-        assert!(!e.measured(Some(t0)));
-        assert!(!e.measured(None));
-        // measured during it: the drop's
-        assert!(e.measured(Some(t0 + s(2))));
-        // a later cut in the same episode keeps its start
-        e.on_decrease(t0 + s(2), 2_550_000.);
-        assert!(e.measured(Some(t0 + s(1))));
-        // once the episode is over, estimates hold again
-        assert!(e
-            .recovery_increase(t0 + s(30), 2_000_000., true, 0.1)
-            .is_none());
-        assert!(!e.measured(Some(t0 + s(2))));
     }
 
     #[test]
