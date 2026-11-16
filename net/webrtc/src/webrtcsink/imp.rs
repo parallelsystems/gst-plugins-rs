@@ -1063,7 +1063,12 @@ impl VideoEncoder {
                     .set_property("bitrate", (bitrate / 1000) as u32);
             }
             "nvv4l2h264enc" | "nvv4l2h265enc" | "nvv4l2vp8enc" | "nvv4l2vp9enc"
-            | "nvv4l2av1enc" => self.element.set_property("bitrate", bitrate as u32),
+            | "nvv4l2av1enc" => {
+                self.element.set_property("bitrate", bitrate as u32);
+                let fps = self.framerate().unwrap_or(10.);
+                let vbv = (bitrate as f64 / fps) as u32;
+                self.element.set_property("vbv-size", vbv.max(100_000));
+            },
             "rav1enc" => self.element.set_property("bitrate", bitrate),
             _ => return Err(WebRTCSinkError::BitrateNotSupported),
         }
