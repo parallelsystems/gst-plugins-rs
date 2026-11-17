@@ -91,6 +91,53 @@ const MAX_INCREASE_INTERVAL: Duration = Duration::from_secs(1);
 /// framerate is unknown (variable framerate, or not negotiated yet)
 const FALLBACK_FRAMERATE: f64 = 30.;
 
+/// Half-width of the congestion window around the bitrate EMA, in standard
+/// deviations (gcc section 5.5). Below it the delay controller increases
+/// multiplicatively, inside it additively, above it the window is
+/// discarded. main used 7: after a few deep cuts the standard deviation
+/// covered the whole range, and the controller stayed additive, climbing
+/// ~70 kbps/s from the floor (hitl1116 regression).
+const CONGESTION_WINDOW_STDDEVS: f64 = 3.;
+
+/// Lower bound on the standard deviation used for the congestion window, as
+/// a fraction of the EMA, so a window seeded by one or two decreases isn't
+/// nearly zero wide
+const MIN_BITRATE_STDDEV_RATIO: f64 = 0.05;
+
+/// Time without a delay decrease after which the congestion window is
+/// discarded and the delay controller increases multiplicatively again
+const CONGESTION_WINDOW_EXPIRY: Duration = Duration::from_secs(5);
+
+/// Where a target sits against the congestion window
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WindowPosition {
+    Below,
+    Inside,
+    Above,
+}
+
+/// Where `target` sits against the congestion window around `ema`
+fn window_position(target: f64, ema: f64, emvar: f64) -> WindowPosition {
+    let stdev = f64::max(emvar.sqrt(), MIN_BITRATE_STDDEV_RATIO * ema);
+    if target < ema - CONGESTION_WINDOW_STDDEVS * stdev {
+        WindowPosition::Below
+    } else if target > ema + CONGESTION_WINDOW_STDDEVS * stdev {
+        WindowPosition::Above
+    } else {
+        WindowPosition::Inside
+    }
+}
+
+/// How long the delay controller ignores the stats after a decrease before
+/// it starts collecting a new window: what was sent at the old bitrate is
+/// still queued and in flight for a response time (RESPONSE_TIME_BASE +
+/// RTT), and the TWCC stats keep counting it for about a window. Without it
+/// the window right after a cut still saw the backlog and cut again, from
+/// 3.7 to 0.6 Mbps in 2 s on a step to 3 Mbps (hitl1116 regression).
+fn delay_settle_time(rtt: f64, window: Duration) -> Duration {
+    RESPONSE_TIME_BASE + Duration::from_secs_f64(rtt.max(0.)) + window
+}
+
 /// Seconds since `last`, bounded by MAX_INCREASE_INTERVAL, 0 on the first update
 fn increase_interval_secs(last: Option<Instant>, now: Instant) -> f64 {
     last.map_or(0., |last| {
@@ -272,6 +319,9 @@ pub struct CongestionController {
     last_update_time: Option<Instant>,
     /// Time of the last loss controller update, same purpose
     last_loss_update_time: Option<Instant>,
+    /// Time of the last delay decrease: the delay controller settles after
+    /// it, and the congestion window expires without another
+    last_delay_decrease: Option<Instant>,
     /// Delay signals averaged over a GOP-long window before thresholding
     delay_signals: DelaySignals,
     /// For logging purposes
@@ -291,6 +341,7 @@ impl CongestionController {
             bitrate_emvar: 0.,
             last_update_time: None,
             last_loss_update_time: None,
+            last_delay_decrease: None,
             delay_signals: DelaySignals::default(),
             peer_id: peer_id.to_string(),
             min_bitrate,
@@ -337,6 +388,21 @@ impl CongestionController {
             twcc_stats
         );
 
+        let settle = delay_settle_time(rtt, self.delay_signals.window);
+        if self
+            .last_delay_decrease
+            .is_some_and(|t| now.duration_since(t) < settle)
+        {
+            gst::trace!(
+                CAT,
+                obj = element,
+                "consumer {}: settling for {:?} after the last delay decrease, holding",
+                self.peer_id,
+                settle
+            );
+            return CongestionControlOp::Hold;
+        }
+
         // Signed on purpose: burst-drain artifacts push recv both above and
         // below sent, and only a sustained excess of sent over recv means
         // congestion. Clamping each sample to >= 0 before averaging would
@@ -381,9 +447,22 @@ impl CongestionController {
                 reason: format!("High delta: {delta_of_delta}"),
             }
         } else {
-            CongestionControlOp::Increase(if let Some(ema) = self.bitrate_ema {
-                let bitrate_stdev = self.bitrate_emvar.sqrt();
+            if self.bitrate_ema.is_some()
+                && self
+                    .last_delay_decrease
+                    .is_some_and(|t| now.duration_since(t) >= CONGESTION_WINDOW_EXPIRY)
+            {
+                gst::debug!(
+                    CAT,
+                    obj = element,
+                    "consumer {}: no delay decrease for {:?}, discarding congestion window",
+                    self.peer_id,
+                    CONGESTION_WINDOW_EXPIRY
+                );
+                self.bitrate_ema = None;
+            }
 
+            CongestionControlOp::Increase(if let Some(ema) = self.bitrate_ema {
                 gst::trace!(
                     CAT,
                     obj = element,
@@ -391,45 +470,51 @@ impl CongestionController {
                     self.peer_id,
                     target_bitrate,
                     ema,
-                    bitrate_stdev,
+                    self.bitrate_emvar.sqrt(),
                 );
 
-                // gcc section 5.5 advises 3 standard deviations, but experiments
-                // have shown this to be too low, probably related to the rest of
-                // homegrown algorithm not implementing gcc, revisit when implementing
-                // the rest of the RFC
-                if target_bitrate < ema - 7. * bitrate_stdev {
-                    gst::trace!(
-                        CAT,
-                        obj = element,
-                        "consumer {}: below last congestion window",
-                        self.peer_id
-                    );
-                    /* Multiplicative increase */
-                    multiplicative_increase(interval_secs)
-                } else if target_bitrate > ema + 7. * bitrate_stdev {
-                    gst::trace!(
-                        CAT,
-                        obj = element,
-                        "consumer {}: above last congestion window",
-                        self.peer_id
-                    );
-                    /* We have gone past our last estimated max bandwidth
-                     * network situation may have changed, go back to
-                     * multiplicative increase
-                     */
-                    self.bitrate_ema.take();
-                    multiplicative_increase(interval_secs)
-                } else {
-                    gst::trace!(
-                        CAT,
-                        obj = element,
-                        "consumer {}: still in last congestion window",
-                        self.peer_id,
-                    );
+                match window_position(target_bitrate, ema, self.bitrate_emvar) {
+                    WindowPosition::Below => {
+                        gst::trace!(
+                            CAT,
+                            obj = element,
+                            "consumer {}: below last congestion window",
+                            self.peer_id
+                        );
+                        /* Multiplicative increase */
+                        multiplicative_increase(interval_secs)
+                    }
+                    WindowPosition::Above => {
+                        gst::trace!(
+                            CAT,
+                            obj = element,
+                            "consumer {}: above last congestion window",
+                            self.peer_id
+                        );
+                        /* We have gone past our last estimated max bandwidth
+                         * network situation may have changed, go back to
+                         * multiplicative increase
+                         */
+                        self.bitrate_ema.take();
+                        multiplicative_increase(interval_secs)
+                    }
+                    WindowPosition::Inside => {
+                        gst::trace!(
+                            CAT,
+                            obj = element,
+                            "consumer {}: still in last congestion window",
+                            self.peer_id,
+                        );
 
-                    /* Additive increase */
-                    self.additive_increase(element, target_bitrate, interval_secs, rtt, encoders)
+                        /* Additive increase */
+                        self.additive_increase(
+                            element,
+                            target_bitrate,
+                            interval_secs,
+                            rtt,
+                            encoders,
+                        )
+                    }
                 }
             } else {
                 /* Multiplicative increase */
@@ -640,6 +725,7 @@ impl CongestionController {
         if let (CongestionControlOp::Decrease { .. }, ControllerType::Delay) =
             (&control_op, controller_type)
         {
+            self.last_delay_decrease = Some(Instant::now());
             // Smoothing factor
             let alpha = 0.75;
             if let Some(ema) = self.bitrate_ema {
@@ -804,6 +890,37 @@ mod tests {
         signals.reset();
         signals.push(t0 + ms(1100), 0.5, 0.);
         assert_eq!(signals.averages(t0 + ms(1500)), None);
+    }
+
+    #[test]
+    fn congestion_window_is_three_stddevs_wide() {
+        // the regression run: an EMA of ~2 Mbps built from cuts of a few
+        // Mbps each. At 7 sigma the window covered the floor to the max;
+        // at 3 the climb from the floor is multiplicative.
+        let ema = 2e6;
+        let emvar = 0.6e6_f64.powi(2);
+        assert_eq!(window_position(0.5e6, ema, emvar), WindowPosition::Inside);
+        let emvar = 0.4e6_f64.powi(2);
+        assert_eq!(window_position(0.5e6, ema, emvar), WindowPosition::Below);
+        assert_eq!(window_position(2.5e6, ema, emvar), WindowPosition::Inside);
+        assert_eq!(window_position(3.5e6, ema, emvar), WindowPosition::Above);
+        // a window seeded by one cut (no variance) is still 5% wide
+        assert_eq!(window_position(2.2e6, ema, 0.), WindowPosition::Inside);
+        assert_eq!(window_position(2.4e6, ema, 0.), WindowPosition::Above);
+        assert_eq!(window_position(1.6e6, ema, 0.), WindowPosition::Below);
+    }
+
+    #[test]
+    fn delay_controller_settles_for_a_response_time_and_a_window() {
+        let window = Duration::from_millis(500);
+        assert_eq!(delay_settle_time(0., window), Duration::from_millis(600));
+        assert_eq!(delay_settle_time(0.25, window), Duration::from_millis(850));
+        // with the 2.5 s window of a 25 frame GOP at 10 fps
+        assert_eq!(
+            delay_settle_time(0.125, Duration::from_millis(2500)),
+            Duration::from_millis(2725)
+        );
+        assert_eq!(delay_settle_time(-1., window), Duration::from_millis(600));
     }
 
     #[test]
