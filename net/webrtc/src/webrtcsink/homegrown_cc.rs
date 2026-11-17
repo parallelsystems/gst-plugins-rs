@@ -138,6 +138,20 @@ fn delay_settle_time(rtt: f64, window: Duration) -> Duration {
     RESPONSE_TIME_BASE + Duration::from_secs_f64(rtt.max(0.)) + window
 }
 
+/// Stats the loss controller waits for after a cut, on top of the response
+/// time, before it judges the loss again: TWCC's packet-loss-pct keeps
+/// counting what was lost at the old bitrate for about this long
+const LOSS_STATS_WINDOW: Duration = Duration::from_secs(1);
+
+/// How long the loss controller holds after a decrease. The loss reports in
+/// the meantime are about packets sent at the old bitrate, still queued or
+/// in flight, and cutting on each of them cuts again for the same loss:
+/// seven 30% cuts in 1.5 s took a step from 6 to 3 Mbps down to the 500 kbps
+/// floor (hitl1116 regression rev1).
+fn loss_settle_time(rtt: f64) -> Duration {
+    RESPONSE_TIME_BASE + Duration::from_secs_f64(rtt.max(0.)) + LOSS_STATS_WINDOW
+}
+
 /// Seconds since `last`, bounded by MAX_INCREASE_INTERVAL, 0 on the first update
 fn increase_interval_secs(last: Option<Instant>, now: Instant) -> f64 {
     last.map_or(0., |last| {
@@ -322,6 +336,10 @@ pub struct CongestionController {
     /// Time of the last delay decrease: the delay controller settles after
     /// it, and the congestion window expires without another
     last_delay_decrease: Option<Instant>,
+    /// Time of the last loss decrease: the loss controller settles after it
+    last_loss_decrease: Option<Instant>,
+    /// Latest round-trip time from the stats, seconds
+    rtt: f64,
     /// Delay signals averaged over a GOP-long window before thresholding
     delay_signals: DelaySignals,
     /// For logging purposes
@@ -342,6 +360,8 @@ impl CongestionController {
             last_update_time: None,
             last_loss_update_time: None,
             last_delay_decrease: None,
+            last_loss_decrease: None,
+            rtt: 0.,
             delay_signals: DelaySignals::default(),
             peer_id: peer_id.to_string(),
             min_bitrate,
@@ -661,6 +681,21 @@ impl CongestionController {
         let now = Instant::now();
         let interval_secs = increase_interval_secs(self.last_loss_update_time.replace(now), now);
 
+        let settle = loss_settle_time(self.rtt);
+        if self
+            .last_loss_decrease
+            .is_some_and(|t| now.duration_since(t) < settle)
+        {
+            gst::trace!(
+                CAT,
+                obj = element,
+                "consumer {}: loss {loss_percentage:.1}%, settling for {:?} after the last loss decrease, holding",
+                self.peer_id,
+                settle
+            );
+            return;
+        }
+
         self.apply_control_op(
             element,
             encoders,
@@ -686,6 +721,7 @@ impl CongestionController {
     ) {
         if let Some(twcc_stats) = lookup_twcc_stats(stats) {
             let rtt = self.lookup_rtt(stats);
+            self.rtt = rtt;
             let op = self.update_delay(element, &twcc_stats, rtt, encoders);
             self.apply_control_op(element, encoders, op, ControllerType::Delay);
         }
@@ -721,6 +757,12 @@ impl CongestionController {
             n_encoders,
             controller_type,
         );
+
+        if let (CongestionControlOp::Decrease { .. }, ControllerType::Loss) =
+            (&control_op, controller_type)
+        {
+            self.last_loss_decrease = Some(Instant::now());
+        }
 
         if let (CongestionControlOp::Decrease { .. }, ControllerType::Delay) =
             (&control_op, controller_type)
@@ -921,6 +963,26 @@ mod tests {
             Duration::from_millis(2725)
         );
         assert_eq!(delay_settle_time(-1., window), Duration::from_millis(600));
+    }
+
+    #[test]
+    fn loss_controller_settles_for_a_response_time_and_a_second() {
+        // no RTT from the stats (Janus sends no receiver reports): 1.1 s
+        assert_eq!(loss_settle_time(0.), Duration::from_millis(1100));
+        assert_eq!(loss_settle_time(0.25), Duration::from_millis(1350));
+        assert_eq!(loss_settle_time(-1.), Duration::from_millis(1100));
+        // the 6 to 3 Mbps step: one 0.70 cut per settle period instead of
+        // one per stats update, 4.5 Mbps reaches ~1.1 Mbps in four periods
+        // rather than the floor in 1.5 s
+        let mut bitrate = 4_500_000;
+        let cut = CongestionControlOp::Decrease {
+            factor: 0.7,
+            reason: String::new(),
+        };
+        for _ in 0..4 {
+            bitrate = next_target(bitrate, &cut, bitrate);
+        }
+        assert!((1_000_000..1_200_000).contains(&bitrate));
     }
 
     #[test]
