@@ -152,6 +152,63 @@ fn loss_settle_time(rtt: f64) -> Duration {
     RESPONSE_TIME_BASE + Duration::from_secs_f64(rtt.max(0.)) + LOSS_STATS_WINDOW
 }
 
+/// Loss percentage above which the loss controller decreases...
+const LOSS_DECREASE_THRESHOLD_PCT: f64 = 10.;
+/// ... and at or below which it increases; in between it holds
+const LOSS_INCREASE_THRESHOLD_PCT: f64 = 2.;
+
+/// Loss decreases less than this apart belong to one loss episode
+const LOSS_EPISODE_GAP: Duration = Duration::from_secs(5);
+
+/// Deepest single loss cut
+const MIN_LOSS_DECREASE_FACTOR: f64 = 0.5;
+
+/// Factor the loss controller cuts by at `loss_pct`. The first cut of an
+/// episode goes down to what got through, (1 - loss): one cut lands near
+/// the link, where 1 - loss/2 left the target above it to overflow again.
+/// Later cuts in the episode keep 1 - loss/2 within 0.7 to 0.98: the loss
+/// they see is inflated by the retransmissions of the first overflow, which
+/// kept it above 10% for ~5 s with the target well below the link (hitl1116
+/// regression rev2, 5.5 Mbps segment).
+fn loss_decrease_factor(loss_pct: f64, first_in_episode: bool) -> f64 {
+    if first_in_episode {
+        (1. - loss_pct / 100.).clamp(MIN_LOSS_DECREASE_FACTOR, 0.98)
+    } else {
+        ((100. - 0.5 * loss_pct) / 100.).clamp(0.7, 0.98)
+    }
+}
+
+/// From this fraction of the break point (the loss target where the last
+/// loss episode started), the loss controller increases additively instead
+/// of multiplicatively. Without it each climb hit the same limit at 8%/s and
+/// overflowed the buffer again, a ~21 s sawtooth between ~1.8 and 5 Mbps on
+/// a 5.5 Mbps link (hitl1116 regression rev2).
+const LOSS_BREAK_POINT_SLOWDOWN_RATIO: f64 = 0.85;
+
+/// The break point is forgotten this long after the last loss decrease
+const LOSS_BREAK_POINT_EXPIRY: Duration = Duration::from_secs(30);
+
+/// How the loss controller increases
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LossIncrease {
+    /// Well below the break point, or none known
+    Multiplicative,
+    /// Approaching the break point: creep up to it
+    Additive,
+    /// At or past the break point without loss: the link took it, forget it
+    PastBreakPoint,
+}
+
+/// How the loss controller increases from `target` with `break_point`
+fn loss_increase(target: f64, break_point: Option<f64>) -> LossIncrease {
+    match break_point {
+        None => LossIncrease::Multiplicative,
+        Some(bp) if target >= bp => LossIncrease::PastBreakPoint,
+        Some(bp) if target >= LOSS_BREAK_POINT_SLOWDOWN_RATIO * bp => LossIncrease::Additive,
+        Some(_) => LossIncrease::Multiplicative,
+    }
+}
+
 /// Seconds since `last`, bounded by MAX_INCREASE_INTERVAL, 0 on the first update
 fn increase_interval_secs(last: Option<Instant>, now: Instant) -> f64 {
     last.map_or(0., |last| {
@@ -338,6 +395,9 @@ pub struct CongestionController {
     last_delay_decrease: Option<Instant>,
     /// Time of the last loss decrease: the loss controller settles after it
     last_loss_decrease: Option<Instant>,
+    /// Loss target at the first decrease of the last loss episode: where
+    /// the link started dropping packets
+    loss_break_point: Option<f64>,
     /// Latest round-trip time from the stats, seconds
     rtt: f64,
     /// Delay signals averaged over a GOP-long window before thresholding
@@ -361,6 +421,7 @@ impl CongestionController {
             last_loss_update_time: None,
             last_delay_decrease: None,
             last_loss_decrease: None,
+            loss_break_point: None,
             rtt: 0.,
             delay_signals: DelaySignals::default(),
             peer_id: peer_id.to_string(),
@@ -696,21 +757,69 @@ impl CongestionController {
             return;
         }
 
-        self.apply_control_op(
-            element,
-            encoders,
-            if loss_percentage > 10. {
-                CongestionControlOp::Decrease {
-                    factor: ((100. - (0.5 * loss_percentage)) / 100.).clamp(0.7, 0.98),
-                    reason: format!("High loss: {loss_percentage}"),
+        if self
+            .last_loss_decrease
+            .is_some_and(|t| now.duration_since(t) >= LOSS_BREAK_POINT_EXPIRY)
+            && self.loss_break_point.take().is_some()
+        {
+            gst::debug!(
+                CAT,
+                obj = element,
+                "consumer {}: no loss decrease for {:?}, forgetting the loss break point",
+                self.peer_id,
+                LOSS_BREAK_POINT_EXPIRY
+            );
+        }
+
+        let op = if loss_percentage > LOSS_DECREASE_THRESHOLD_PCT {
+            let first_in_episode = self
+                .last_loss_decrease
+                .map_or(true, |t| now.duration_since(t) >= LOSS_EPISODE_GAP);
+            if first_in_episode {
+                let break_point = self.target_bitrate_on_loss as f64;
+                gst::debug!(
+                    CAT,
+                    obj = element,
+                    "consumer {}: loss {loss_percentage:.1}% at {break_point:.0}, new loss break point",
+                    self.peer_id,
+                );
+                self.loss_break_point = Some(break_point);
+            }
+            CongestionControlOp::Decrease {
+                factor: loss_decrease_factor(loss_percentage, first_in_episode),
+                reason: format!("High loss: {loss_percentage}"),
+            }
+        } else if loss_percentage > LOSS_INCREASE_THRESHOLD_PCT {
+            CongestionControlOp::Hold
+        } else {
+            let target = self.target_bitrate_on_loss as f64;
+            CongestionControlOp::Increase(match loss_increase(target, self.loss_break_point) {
+                LossIncrease::Multiplicative => multiplicative_increase(interval_secs),
+                LossIncrease::Additive => {
+                    gst::trace!(
+                        CAT,
+                        obj = element,
+                        "consumer {}: loss target {target:.0} approaching the break point {:.0?}",
+                        self.peer_id,
+                        self.loss_break_point,
+                    );
+                    self.additive_increase(element, target, interval_secs, self.rtt, encoders)
                 }
-            } else if loss_percentage > 2. {
-                CongestionControlOp::Hold
-            } else {
-                CongestionControlOp::Increase(multiplicative_increase(interval_secs))
-            },
-            ControllerType::Loss,
-        );
+                LossIncrease::PastBreakPoint => {
+                    gst::debug!(
+                        CAT,
+                        obj = element,
+                        "consumer {}: loss target {target:.0} past the break point {:.0?} without loss, forgetting it",
+                        self.peer_id,
+                        self.loss_break_point,
+                    );
+                    self.loss_break_point = None;
+                    multiplicative_increase(interval_secs)
+                }
+            })
+        };
+
+        self.apply_control_op(element, encoders, op, ControllerType::Loss);
     }
 
     pub fn delay_control(
@@ -983,6 +1092,33 @@ mod tests {
             bitrate = next_target(bitrate, &cut, bitrate);
         }
         assert!((1_000_000..1_200_000).contains(&bitrate));
+    }
+
+    #[test]
+    fn first_loss_cut_goes_to_what_got_through() {
+        // rev2 at the 5.5 Mbps cap: ~26% loss, the first cut was x0.87
+        assert!((loss_decrease_factor(26., true) - 0.74).abs() < 1e-9);
+        assert!((loss_decrease_factor(26., false) - 0.87).abs() < 1e-9);
+        // never deeper than half, nor shallower than 2%
+        assert_eq!(loss_decrease_factor(80., true), MIN_LOSS_DECREASE_FACTOR);
+        assert_eq!(loss_decrease_factor(11., true), 0.89);
+        assert_eq!(loss_decrease_factor(1., true), 0.98);
+        // later cuts in the episode keep the old 0.7 to 0.98
+        assert_eq!(loss_decrease_factor(80., false), 0.7);
+    }
+
+    #[test]
+    fn loss_climb_slows_near_the_break_point() {
+        let bp = Some(5_000_000.);
+        assert_eq!(
+            loss_increase(3_000_000., None),
+            LossIncrease::Multiplicative
+        );
+        assert_eq!(loss_increase(1_800_000., bp), LossIncrease::Multiplicative);
+        assert_eq!(loss_increase(4_200_000., bp), LossIncrease::Multiplicative);
+        assert_eq!(loss_increase(4_250_000., bp), LossIncrease::Additive);
+        assert_eq!(loss_increase(4_900_000., bp), LossIncrease::Additive);
+        assert_eq!(loss_increase(5_000_000., bp), LossIncrease::PastBreakPoint);
     }
 
     #[test]
