@@ -1,0 +1,2518 @@
+// SPDX-License-Identifier: MPL-2.0
+
+/**
+ * element-rtppacer:
+ *
+ * Paces outgoing RTP packets so they leave at a steady rate instead of in
+ * the bursts the encoders produce, and reports, packet by packet, what the
+ * transport-wide congestion control feedback says happened to them.
+ *
+ * Like `rtpgccbwe`, this element should be placed right before an
+ * `rtpsession` (e.g. as the `webrtcbin` aux sender, which puts it after
+ * `rtprtxsend`) and only reports feedback when TWCC is enabled.
+ *
+ * Pacing: packets leave at #rtppacer:pacing-factor times #rtppacer:bitrate.
+ * The queue holds at most one frame interval (and at least 30 ms) of data
+ * at that rate, or a few frame intervals while a keyframe, or a frame much
+ * larger than the usual delta frame, is queued. Rather than sending what
+ * doesn't fit as a burst, the pacer then speeds up just enough to drain the
+ * queue within that time.
+ *
+ * Retransmissions skip ahead of queued media, within a budget of their own,
+ * #rtppacer:rtx-max-ratio times #rtppacer:bitrate, on top of the media.
+ * Retransmissions that waited too long for that budget are dropped, as are
+ * those of a packet already retransmitted within the last round-trip time
+ * (#rtppacer:rtt): the receiver asks again for packets whose retransmission
+ * is lost, and on a congested link answering every request multiplies the
+ * traffic that congested it.
+ *
+ * Feedback: as packets go through, the pacer classifies them (media in a
+ * keyframe or a delta frame, retransmission answering a NACK, other RTX),
+ * then matches the `RTPTWCCPackets` events `rtpsession` sends upstream
+ * against what it sent, and emits #rtppacer::packet-feedback with the
+ * annotated packets.
+ *
+ * Stats: #rtppacer:stats holds, for the last second and per kind of
+ * packet, how long packets waited in the pacer, how long retransmissions
+ * took to go out after their NACK, and the one-way delay feedback reported
+ * for them over the lowest of the last 10 s (the queuing on the path, as
+ * sender and receiver clocks differ).
+ * Each feedback packet also carries its `pacer-delay`.
+ *
+ * Keyframes are recognised from the buffers' DELTA_UNIT flag, which the
+ * H.264/H.265 payloaders copy from the encoder. Payloaders that never set
+ * the flag get none of their frames treated as keyframes, only as large
+ * frames when they are.
+ */
+use gst::{glib, prelude::*, subclass::prelude::*};
+use once_cell::sync::Lazy;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+
+static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
+    gst::DebugCategory::new(
+        "rtppacer",
+        gst::DebugColorFlags::empty(),
+        Some("RTP pacer with per-packet TWCC feedback"),
+    )
+});
+
+const DEFAULT_BITRATE: u32 = 2_048_000;
+const DEFAULT_PACING_FACTOR: f64 = 1.5;
+const DEFAULT_FRAMERATE: f64 = 10.;
+const DEFAULT_GOP_SIZE: u32 = 25;
+const DEFAULT_RTX_MAX_RATIO: f64 = 0.5;
+
+/// How often the pacer wakes up to send what its budget allows
+const TICK: Duration = Duration::from_millis(5);
+
+/// The queue holds at least this much data at the pacing rate before the
+/// pacer speeds up
+const MIN_PACING_QUEUE: Duration = Duration::from_millis(30);
+
+/// While a keyframe is queued the queue may hold this many frame intervals
+/// of data at the pacing rate...
+const KEYFRAME_QUEUE_FRAMES: f64 = 3.;
+
+/// ... but no more than this fraction of a GOP, so a keyframe is through
+/// well before the next one is due
+const KEYFRAME_QUEUE_GOP_FRACTION: f64 = 0.5;
+
+/// A frame this many times the median delta frame is paced like a keyframe,
+/// e.g. an intra frame the encoder doesn't flag as one...
+const LARGE_FRAME_RATIO: f64 = 3.;
+
+/// ... if it also takes longer than this many frame intervals to send at
+/// the bitrate: a smaller one is sent before the next frame comes, whatever
+/// the frames before it were (e.g. tiny frames of a static scene at start)
+const LARGE_FRAME_MIN_INTERVALS: f64 = 1.5;
+
+/// The median delta frame is taken over the last GOP of them, within these
+/// bounds (all of them when the GOP is unknown)
+const MIN_DELTA_FRAME_WINDOW: usize = 5;
+const MAX_DELTA_FRAME_WINDOW: usize = 50;
+
+/// Stats are gathered over this long, then kept in `stats`
+const STATS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The one-way delay of an empty path is the lowest over this long, in
+/// buckets so old lows age out
+const NETWORK_BASE_WINDOW_NS: i64 = 10_000_000_000;
+const NETWORK_BASE_BUCKET_NS: i64 = 1_000_000_000;
+
+/// Sent packets and frames are kept this long waiting for their feedback
+const SENT_LOG_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// A retransmission request is answered within this long; RTX packets that
+/// don't answer one are padding
+const RTX_REQUEST_MAX_AGE: Duration = Duration::from_secs(1);
+
+/// Retransmission budget left unused can add up to this long's worth
+const RTX_BUDGET_WINDOW: Duration = Duration::from_millis(50);
+
+/// A retransmission still queued after this long is dropped: the receiver
+/// has asked again or given up on it by then
+const RTX_MAX_QUEUE_TIME: Duration = Duration::from_millis(250);
+
+/// A packet isn't retransmitted again within the round-trip time, nor
+/// within this long while it's unknown
+const MIN_RTX_INTERVAL: Duration = Duration::from_millis(50);
+
+/// What a packet is, as far as feedback is concerned
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Media packet, from the payloader
+    Media,
+    /// Retransmission answering a NACK
+    RtxRepair,
+    /// Retransmission nobody asked for, sent as bandwidth probing padding
+    RtxPadding,
+}
+
+impl Kind {
+    const ALL: [Kind; 3] = [Kind::Media, Kind::RtxRepair, Kind::RtxPadding];
+
+    /// Position in Kind::ALL
+    fn index(self) -> usize {
+        match self {
+            Kind::Media => 0,
+            Kind::RtxRepair => 1,
+            Kind::RtxPadding => 2,
+        }
+    }
+
+    /// Name used for the `kind` field of the feedback
+    fn as_str(self) -> &'static str {
+        match self {
+            Kind::Media => "media",
+            Kind::RtxRepair => "rtx-repair",
+            Kind::RtxPadding => "rtx-padding",
+        }
+    }
+}
+
+/// What the pacer knows about a packet going through
+#[derive(Debug, Clone, Copy)]
+struct PacketInfo {
+    /// RTP payload type
+    pt: u8,
+    /// RTP SSRC
+    ssrc: u32,
+    /// RTP sequence number
+    seqnum: u16,
+    /// RTP timestamp
+    rtp_ts: u32,
+    /// RTP marker bit, set on the last packet of a frame
+    marker: bool,
+    /// RTP payload size, what TWCC feedback reports as the size
+    payload_len: u32,
+    /// rtpsession only gives packets with a header extension a TWCC seqnum
+    has_extension: bool,
+    /// Media or RTX
+    kind: Kind,
+    /// Media: the frame it belongs to (Frame::uid)
+    frame: Option<u64>,
+    /// Media: whether it's the frame's first packet
+    frame_start: bool,
+    /// RTX: the sequence number of the packet it carries
+    osn: Option<u16>,
+    /// RTX repair: when the retransmission was requested
+    requested_at: Option<Instant>,
+}
+
+/// A video frame, as seen in its packets
+#[derive(Debug, Clone)]
+struct Frame {
+    /// Unique id, increasing across streams
+    uid: u64,
+    /// RTP timestamp shared by its packets
+    rtp_ts: u32,
+    /// Payload bytes so far
+    bytes: u64,
+    /// Packets so far
+    packets: u32,
+    /// Its packets aren't flagged as delta units
+    keyframe: bool,
+    /// Keyframe that came before the GOP was over, i.e. on request (PLI/FIR)
+    requested: bool,
+    /// Not flagged as a keyframe, but sized like one
+    large: bool,
+    /// Its last packet (marker bit) has been seen
+    complete: bool,
+    /// When its first packet arrived
+    created: Instant,
+}
+
+impl Frame {
+    /// Whether the frame is sent as a burst the queue can't absorb in one
+    /// frame interval: a keyframe or a large delta frame
+    fn is_burst(&self) -> bool {
+        self.keyframe || self.large
+    }
+}
+
+/// Per-SSRC frame tracking
+#[derive(Debug)]
+struct MediaStream {
+    /// RTP SSRC of the stream
+    ssrc: u32,
+    /// The payloader flags delta units, so a buffer without the flag
+    /// belongs to a keyframe
+    delta_flags_seen: bool,
+    /// Frames since the last keyframe, None before the first one
+    frames_since_keyframe: Option<u64>,
+    /// Sizes of the last delta frames, large ones included, so a lasting
+    /// change in frame size becomes the norm within half a window
+    delta_frame_bytes: VecDeque<u64>,
+    /// Median of `delta_frame_bytes`, to spot large frames
+    median_delta_frame_bytes: Option<f64>,
+    /// The frame being received
+    current: Option<u64>,
+}
+
+/// Median of frame sizes, None if there are none
+fn median(sizes: &VecDeque<u64>) -> Option<f64> {
+    let mut sorted = sizes.iter().copied().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    match sorted.len() {
+        0 => None,
+        len if len % 2 == 0 => Some((sorted[mid - 1] + sorted[mid]) as f64 / 2.),
+        _ => Some(sorted[mid] as f64),
+    }
+}
+
+/// A packet waiting in the pacer
+struct Queued {
+    /// The RTP packet
+    buffer: gst::Buffer,
+    /// What's known about it, None if it isn't RTP
+    info: Option<PacketInfo>,
+    /// When it entered the queue
+    enqueued: Instant,
+    /// When it must have left the pacer, set when it's queued
+    deadline: Instant,
+}
+
+/// What the pacer pushes downstream
+enum Output {
+    /// An RTP packet
+    Buffer(gst::Buffer),
+    /// A serialized event that was queued behind packets
+    Event(gst::Event),
+}
+
+/// A packet that left the pacer with a TWCC extension
+#[derive(Debug)]
+struct Sent {
+    /// Position in the order rtpsession numbers packets
+    index: u64,
+    /// What the pacer knew about it
+    info: PacketInfo,
+    /// When it left the pacer
+    at: Instant,
+    /// How long it waited in the pacer
+    pacer_delay: Duration,
+}
+
+/// Delays of one kind of packet over a stats interval, in microseconds
+#[derive(Debug, Default)]
+struct DelaySamples(Vec<f64>);
+
+impl DelaySamples {
+    fn push(&mut self, delay: Duration) {
+        self.0.push(delay.as_secs_f64() * 1e6);
+    }
+
+    /// Same, from a delay in ns that can be negative
+    fn push_ns(&mut self, ns: i64) {
+        self.0.push(ns as f64 / 1e3);
+    }
+
+    /// Adds `<name>-mean-us`, `<name>-p95-us` and `<name>-max-us`, in whole
+    /// microseconds, if there are samples
+    fn add_fields(
+        &mut self,
+        mut s: gst::structure::Builder,
+        name: &str,
+    ) -> gst::structure::Builder {
+        if self.0.is_empty() {
+            return s;
+        }
+        self.0.sort_by(f64::total_cmp);
+        let us = |us: f64| us.round() as i64;
+        let mean = self.0.iter().sum::<f64>() / self.0.len() as f64;
+        let p95 = self.0[(0.95 * (self.0.len() - 1) as f64).round() as usize];
+        s = s
+            .field(format!("{name}-mean-us"), us(mean))
+            .field(format!("{name}-p95-us"), us(p95))
+            .field(format!("{name}-max-us"), us(*self.0.last().unwrap()));
+        s
+    }
+}
+
+/// Stats of one kind of packet over a stats interval
+#[derive(Debug, Default)]
+struct KindStats {
+    /// Packets that left the pacer
+    sent: u32,
+    /// How long they waited in the pacer
+    pacer_delay: DelaySamples,
+    /// RTX repairs: from the request to leaving the pacer
+    request_delay: DelaySamples,
+    /// Packets feedback reported on, and of those lost
+    reported: u32,
+    lost: u32,
+    /// One-way delay over the path's base, of those that arrived
+    network_delay: DelaySamples,
+}
+
+/// Stats gathered since `since`
+#[derive(Debug, Default)]
+struct Stats {
+    since: Option<Instant>,
+    kinds: [KindStats; 3],
+    /// Retransmissions dropped for waiting too long
+    rtx_dropped_stale: u32,
+    /// Retransmissions dropped for repeating one within the round-trip time
+    rtx_dropped_repeat: u32,
+}
+
+impl Stats {
+    fn kind(&mut self, kind: Kind) -> &mut KindStats {
+        &mut self.kinds[kind.index()]
+    }
+
+    /// The stats as an `RTPPacerStats` structure, starting over at `now`
+    fn take(
+        &mut self,
+        now: Instant,
+        bitrate: u32,
+        queued_bytes: u64,
+        rtx_dropped: u64,
+    ) -> gst::Structure {
+        let interval = self.since.map_or(Duration::ZERO, |since| now - since);
+        let mut s = gst::Structure::builder("RTPPacerStats")
+            .field("interval-ms", interval.as_millis() as u64)
+            .field("bitrate", bitrate)
+            .field("queued-bytes", queued_bytes);
+        for kind in Kind::ALL {
+            let name = kind.as_str();
+            let stats = self.kind(kind);
+            s = s
+                .field(format!("{name}-sent"), stats.sent)
+                .field(format!("{name}-reported"), stats.reported)
+                .field(format!("{name}-lost"), stats.lost);
+            s = stats
+                .pacer_delay
+                .add_fields(s, &format!("{name}-pacer-delay"));
+            s = stats
+                .request_delay
+                .add_fields(s, &format!("{name}-request-delay"));
+            s = stats
+                .network_delay
+                .add_fields(s, &format!("{name}-network-delay"));
+        }
+        let s = s
+            .field("rtx-dropped-stale", self.rtx_dropped_stale)
+            .field("rtx-dropped-repeat", self.rtx_dropped_repeat)
+            .field("rtx-dropped-total", rtx_dropped)
+            .build();
+        *self = Stats {
+            since: Some(now),
+            ..Default::default()
+        };
+        s
+    }
+}
+
+/// Lowest one-way delay (receiver clock minus sender clock, ns) over
+/// NETWORK_BASE_WINDOW_NS of send times
+#[derive(Debug, Default)]
+struct NetworkBase {
+    buckets: VecDeque<(i64, i64)>,
+}
+
+impl NetworkBase {
+    fn update(&mut self, send_ns: i64, owd: i64) {
+        match self.buckets.back_mut() {
+            Some((start, min)) if send_ns - *start < NETWORK_BASE_BUCKET_NS => {
+                *min = (*min).min(owd)
+            }
+            _ => self.buckets.push_back((send_ns, owd)),
+        }
+        while self
+            .buckets
+            .front()
+            .is_some_and(|(start, _)| send_ns - *start > NETWORK_BASE_WINDOW_NS)
+        {
+            self.buckets.pop_front();
+        }
+    }
+
+    fn get(&self) -> Option<i64> {
+        self.buckets.iter().map(|(_, min)| *min).min()
+    }
+}
+
+/// One packet of an `RTPTWCCPackets` event
+#[derive(Debug, Clone, Copy)]
+struct Feedback {
+    /// Extended TWCC seqnum
+    seqnum: i64,
+    /// Send time on rtpsession's clock
+    local_ts: u64,
+    /// Arrival time on the receiver's clock, None if lost
+    remote_ts: Option<u64>,
+    /// Payload type rtpsession saw, to check alignment
+    pt: u8,
+    /// RTP payload size, to check alignment
+    size: u32,
+    /// Reported lost by the receiver
+    lost: bool,
+}
+
+impl Feedback {
+    /// Parses one packet of an `RTPTWCCPackets` event, with its TWCC seqnum.
+    /// None for packets rtpsession has no send time for.
+    fn from_structure(s: &gst::StructureRef) -> Option<(u16, Self)> {
+        // rtpsession leaves these at NONE for packets it lost track of
+        let local_ts = s.get::<u64>("local-ts").ok().filter(|ts| *ts != u64::MAX)?;
+        let seqnum = s.get::<u32>("seqnum").ok()? as u16;
+        let lost = s.get::<bool>("lost").unwrap_or(false);
+        let remote_ts = s
+            .get::<u64>("remote-ts")
+            .ok()
+            .filter(|ts| !lost && *ts != u64::MAX);
+
+        Some((
+            seqnum,
+            Feedback {
+                seqnum: 0,
+                local_ts,
+                remote_ts,
+                pt: s.get::<u8>("payload-type").unwrap_or(0),
+                size: s.get::<u32>("size").ok()?,
+                lost,
+            },
+        ))
+    }
+}
+
+struct State {
+    /// Target bitrate from the congestion controller, bit/sec
+    bitrate: u32,
+    /// Pacing rate as a multiple of the bitrate
+    pacing_factor: f64,
+    /// Encoder frame rate, sets the queue times
+    framerate: f64,
+    /// Encoder keyframe interval in frames, 0 if unknown
+    gop_size: u32,
+    /// rtprtxsend's payload-type-map, as set
+    rtx_pt_map: Option<gst::Structure>,
+    /// RTX payload types from rtx_pt_map
+    rtx_pts: Vec<u8>,
+    /// Retransmissions may take this many times the bitrate on top of it
+    rtx_max_ratio: f64,
+    /// Round-trip time, none is retransmitted twice within it
+    rtt: Duration,
+
+    /// RTX packets, sent before any media
+    rtx_queue: VecDeque<Queued>,
+    /// Media packets and anything that isn't RTX
+    media_queue: VecDeque<Queued>,
+    /// Serialized events, each with the number of media packets queued
+    /// before it, so they go out in order with the media
+    events: VecDeque<(u64, gst::Event)>,
+    /// Media packets queued since start, to place events
+    media_enqueued: u64,
+    /// Media packets sent since start, to release events
+    media_dequeued: u64,
+    /// Bytes in both queues
+    queued_bytes: u64,
+    /// Bits sent ahead of (negative) or behind (positive) the budget
+    budget_offset: f64,
+    /// When the budget was last updated
+    last_push: Option<Instant>,
+    /// Sending faster than the pacing rate to keep within the queue time
+    speeding_up: bool,
+    /// Bits retransmissions may still send
+    rtx_budget: f64,
+    /// When each (RTX SSRC, original seqnum) was last retransmitted
+    rtx_sent: HashMap<(u32, u16), Instant>,
+    /// Retransmissions dropped since start
+    rtx_dropped: u64,
+    /// Stats of the current interval
+    stats: Stats,
+    /// Stats of the last complete interval
+    last_stats: Option<gst::Structure>,
+    /// Lowest one-way delay feedback reported lately
+    network_base: NetworkBase,
+
+    /// Media streams by SSRC
+    streams: Vec<MediaStream>,
+    /// Ordered by uid
+    frames: VecDeque<Frame>,
+    /// uid for the next new frame
+    next_frame_uid: u64,
+    /// Sequence numbers rtpsession asked rtprtxsend to retransmit
+    rtx_requests: VecDeque<(u16, Instant)>,
+
+    /// Packets that got a TWCC seqnum, in the order rtpsession numbered them
+    sent: VecDeque<Sent>,
+    /// Index for the next packet added to `sent`
+    next_index: u64,
+    /// Extended TWCC seqnum minus index in `sent`, once lined up
+    offset: Option<i64>,
+    /// Highest extended TWCC seqnum seen in feedback
+    twcc_extended_seqnum: Option<i64>,
+
+    /// Clock entry the srcpad task waits on between ticks
+    clock_entry: Option<gst::SingleShotClockId>,
+    /// Last flow return from downstream, returned by the chain function
+    flow_return: Result<gst::FlowSuccess, gst::FlowError>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            bitrate: DEFAULT_BITRATE,
+            pacing_factor: DEFAULT_PACING_FACTOR,
+            framerate: DEFAULT_FRAMERATE,
+            gop_size: DEFAULT_GOP_SIZE,
+            rtx_pt_map: None,
+            rtx_pts: Vec::new(),
+            rtx_max_ratio: DEFAULT_RTX_MAX_RATIO,
+            rtt: Duration::ZERO,
+            rtx_queue: VecDeque::new(),
+            media_queue: VecDeque::new(),
+            events: VecDeque::new(),
+            media_enqueued: 0,
+            media_dequeued: 0,
+            queued_bytes: 0,
+            budget_offset: 0.,
+            last_push: None,
+            speeding_up: false,
+            rtx_budget: 0.,
+            rtx_sent: HashMap::new(),
+            rtx_dropped: 0,
+            stats: Stats::default(),
+            last_stats: None,
+            network_base: NetworkBase::default(),
+            streams: Vec::new(),
+            frames: VecDeque::new(),
+            next_frame_uid: 0,
+            rtx_requests: VecDeque::new(),
+            sent: VecDeque::new(),
+            next_index: 0,
+            offset: None,
+            twcc_extended_seqnum: None,
+            clock_entry: None,
+            flow_return: Err(gst::FlowError::Flushing),
+        }
+    }
+}
+
+impl State {
+    /// Rate in bit/sec the queue drains at when it's within its queue time
+    fn pacing_rate(&self) -> f64 {
+        self.bitrate as f64 * self.pacing_factor
+    }
+
+    /// Rate in bit/sec retransmissions may take on top of the pacing rate
+    fn rtx_rate(&self) -> f64 {
+        self.bitrate as f64 * self.rtx_max_ratio
+    }
+
+    /// How long the queue may take to drain at the pacing rate with only
+    /// delta frames in it: one frame interval, at least MIN_PACING_QUEUE
+    fn frame_queue_time(&self) -> Duration {
+        Duration::from_secs_f64(1. / self.framerate).max(MIN_PACING_QUEUE)
+    }
+
+    /// Same, while a keyframe or large frame is queued
+    fn keyframe_queue_time(&self) -> Duration {
+        let mut secs = KEYFRAME_QUEUE_FRAMES / self.framerate;
+        if self.gop_size > 0 {
+            secs = secs.min(KEYFRAME_QUEUE_GOP_FRACTION * self.gop_size as f64 / self.framerate);
+        }
+        Duration::from_secs_f64(secs).max(self.frame_queue_time())
+    }
+
+    /// Takes rtprtxsend's `payload-type-map` (media PT -> RTX PT) to tell
+    /// RTX packets apart
+    fn set_rtx_pt_map(&mut self, map: Option<gst::Structure>) {
+        self.rtx_pts = map
+            .iter()
+            .flat_map(|s| s.iter())
+            .filter_map(|(_, value)| {
+                value
+                    .get::<u32>()
+                    .ok()
+                    .or_else(|| value.get::<i32>().ok().and_then(|v| u32::try_from(v).ok()))
+                    .and_then(|pt| u8::try_from(pt).ok())
+            })
+            .collect();
+        self.rtx_pt_map = map;
+    }
+
+    /// Frame by uid, if it's still tracked
+    fn frame(&self, uid: u64) -> Option<&Frame> {
+        self.frames
+            .binary_search_by_key(&uid, |f| f.uid)
+            .ok()
+            .map(|i| &self.frames[i])
+    }
+
+    /// Mutable frame by uid, if it's still tracked
+    fn frame_mut(&mut self, uid: u64) -> Option<&mut Frame> {
+        self.frames
+            .binary_search_by_key(&uid, |f| f.uid)
+            .ok()
+            .map(|i| &mut self.frames[i])
+    }
+
+    /// Reads what the pacer needs from an RTP packet: RTX packets are
+    /// repairs if a retransmission was requested for their original sequence number (OSN), padding
+    /// otherwise; media packets are added to their frame. None if it isn't RTP.
+    fn classify(
+        &mut self,
+        element: &super::Pacer,
+        buffer: &gst::BufferRef,
+        now: Instant,
+    ) -> Option<PacketInfo> {
+        let rtp = gst_rtp::RTPBuffer::from_buffer_readable(buffer).ok()?;
+        let pt = rtp.payload_type();
+        let ssrc = rtp.ssrc();
+        let seqnum = rtp.seq();
+        let rtp_ts = rtp.timestamp();
+        let marker = rtp.is_marker();
+        let has_extension = rtp.is_extension();
+        let payload = rtp.payload().ok()?;
+        let payload_len = payload.len() as u32;
+        let osn = (payload.len() >= 2).then(|| u16::from_be_bytes([payload[0], payload[1]]));
+        drop(rtp);
+
+        let mut info = PacketInfo {
+            pt,
+            ssrc,
+            seqnum,
+            rtp_ts,
+            marker,
+            payload_len,
+            has_extension,
+            kind: Kind::Media,
+            frame: None,
+            frame_start: false,
+            osn: None,
+            requested_at: None,
+        };
+
+        if self.rtx_pts.contains(&pt) {
+            // The latest request, if it asked again
+            info.requested_at = osn.and_then(|osn| {
+                self.rtx_requests
+                    .iter()
+                    .rev()
+                    .find(|(seqnum, t)| *seqnum == osn && now - *t <= RTX_REQUEST_MAX_AGE)
+                    .map(|(_, t)| *t)
+            });
+            info.kind = if info.requested_at.is_some() {
+                Kind::RtxRepair
+            } else {
+                Kind::RtxPadding
+            };
+            info.osn = osn;
+            gst::trace!(
+                CAT,
+                obj = element,
+                "RTX packet {seqnum} (ssrc {ssrc:#x}) carrying {osn:?}: {}",
+                info.kind.as_str()
+            );
+            return Some(info);
+        }
+
+        let delta_unit = buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+        let (uid, frame_start) =
+            self.track_frame(element, ssrc, rtp_ts, payload_len, delta_unit, marker, now);
+        info.frame = Some(uid);
+        info.frame_start = frame_start;
+
+        Some(info)
+    }
+
+    /// Adds a media packet to its frame. Returns the frame and whether the
+    /// packet starts it.
+    #[allow(clippy::too_many_arguments)]
+    fn track_frame(
+        &mut self,
+        element: &super::Pacer,
+        ssrc: u32,
+        rtp_ts: u32,
+        payload_len: u32,
+        delta_unit: bool,
+        marker: bool,
+        now: Instant,
+    ) -> (u64, bool) {
+        let stream_idx = match self.streams.iter().position(|s| s.ssrc == ssrc) {
+            Some(idx) => idx,
+            None => {
+                gst::debug!(CAT, obj = element, "New media stream with ssrc {ssrc:#x}");
+                self.streams.push(MediaStream {
+                    ssrc,
+                    delta_flags_seen: false,
+                    frames_since_keyframe: None,
+                    delta_frame_bytes: VecDeque::new(),
+                    median_delta_frame_bytes: None,
+                    current: None,
+                });
+                self.streams.len() - 1
+            }
+        };
+
+        let current = self.streams[stream_idx]
+            .current
+            .filter(|uid| self.frame(*uid).is_some_and(|f| f.rtp_ts == rtp_ts));
+
+        let (uid, frame_start) = match current {
+            Some(uid) => (uid, false),
+            None => {
+                if let Some(prev) = self.streams[stream_idx].current {
+                    self.finish_frame(element, stream_idx, prev);
+                }
+
+                let gop_size = self.gop_size as u64;
+                let uid = self.next_frame_uid;
+                self.next_frame_uid += 1;
+
+                let stream = &mut self.streams[stream_idx];
+                let first = stream.current.is_none();
+                if delta_unit && !stream.delta_flags_seen {
+                    gst::debug!(
+                        CAT,
+                        obj = element,
+                        "Payloader flags delta units on ssrc {ssrc:#x}, frames without the flag \
+                         are keyframes"
+                    );
+                    stream.delta_flags_seen = true;
+                }
+                // The first frame of a stream is a keyframe whether or not
+                // the payloader flags delta units
+                let keyframe = !delta_unit && (stream.delta_flags_seen || first);
+                let requested = keyframe
+                    && gop_size > 0
+                    && stream
+                        .frames_since_keyframe
+                        .is_some_and(|n| n + 1 < gop_size);
+                if keyframe {
+                    match stream.frames_since_keyframe {
+                        Some(n) => gst::debug!(
+                            CAT,
+                            obj = element,
+                            "Keyframe on ssrc {ssrc:#x} (RTP timestamp {rtp_ts}), {} frames \
+                             after the previous one (GOP {gop_size}): {}",
+                            n + 1,
+                            if requested { "requested" } else { "periodic" },
+                        ),
+                        None => gst::debug!(
+                            CAT,
+                            obj = element,
+                            "First keyframe on ssrc {ssrc:#x} (RTP timestamp {rtp_ts})"
+                        ),
+                    }
+                }
+                stream.frames_since_keyframe = if keyframe {
+                    Some(0)
+                } else {
+                    stream.frames_since_keyframe.map(|n| n + 1)
+                };
+                stream.current = Some(uid);
+
+                self.frames.push_back(Frame {
+                    uid,
+                    rtp_ts,
+                    bytes: 0,
+                    packets: 0,
+                    keyframe,
+                    requested,
+                    large: false,
+                    complete: false,
+                    created: now,
+                });
+
+                (uid, true)
+            }
+        };
+
+        if delta_unit {
+            self.streams[stream_idx].delta_flags_seen = true;
+        }
+        let median = self.streams[stream_idx].median_delta_frame_bytes;
+        let threshold = self.large_frame_bytes(median);
+        let frame = self.frame_mut(uid).unwrap();
+        frame.bytes += u64::from(payload_len);
+        frame.packets += 1;
+        if !frame.keyframe && !frame.large && frame.bytes as f64 > threshold {
+            frame.large = true;
+            gst::debug!(
+                CAT,
+                obj = element,
+                "Frame on ssrc {ssrc:#x} (RTP timestamp {rtp_ts}) is over {} bytes, more than \
+                 {threshold:.0} ({LARGE_FRAME_RATIO}x the median delta frame of {:?} bytes, at \
+                 least {LARGE_FRAME_MIN_INTERVALS} frame intervals at the bitrate): pacing it \
+                 like a keyframe",
+                frame.bytes,
+                median.map(f64::round),
+            );
+        }
+
+        if marker {
+            self.finish_frame(element, stream_idx, uid);
+        }
+
+        (uid, frame_start)
+    }
+
+    /// Size above which a delta frame is a large frame, given the median
+    /// delta frame: none is before there's one to compare with
+    fn large_frame_bytes(&self, median: Option<f64>) -> f64 {
+        let min = LARGE_FRAME_MIN_INTERVALS * self.bitrate as f64 / 8. / self.framerate;
+        median.map_or(f64::INFINITY, |median| {
+            f64::max(LARGE_FRAME_RATIO * median, min)
+        })
+    }
+
+    /// How many delta frames the median is taken over
+    fn delta_frame_window(&self) -> usize {
+        match self.gop_size {
+            0 => MAX_DELTA_FRAME_WINDOW,
+            gop_size => (gop_size as usize).clamp(MIN_DELTA_FRAME_WINDOW, MAX_DELTA_FRAME_WINDOW),
+        }
+    }
+
+    /// Marks a frame complete once its last packet is in, and adds delta
+    /// frames to the stream's recent frame sizes
+    fn finish_frame(&mut self, element: &super::Pacer, stream_idx: usize, uid: u64) {
+        let median_delta_frame_bytes = self.streams[stream_idx].median_delta_frame_bytes;
+        let window = self.delta_frame_window();
+        let Some(frame) = self.frame_mut(uid) else {
+            return;
+        };
+        if frame.complete {
+            return;
+        }
+        frame.complete = true;
+
+        if frame.is_burst() {
+            gst::debug!(
+                CAT,
+                obj = element,
+                "{} with RTP timestamp {} complete: {} bytes in {} packets (median delta frame \
+                 {:?} bytes)",
+                if frame.keyframe {
+                    "Keyframe"
+                } else {
+                    "Large frame"
+                },
+                frame.rtp_ts,
+                frame.bytes,
+                frame.packets,
+                median_delta_frame_bytes.map(f64::round),
+            );
+        }
+
+        // Large frames count too: the median ignores the odd one, but leaving
+        // them out would never let a lasting rise in frame size become the
+        // norm, and every frame after it would stay large
+        if !frame.keyframe {
+            let bytes = frame.bytes;
+            let stream = &mut self.streams[stream_idx];
+            stream.delta_frame_bytes.push_back(bytes);
+            while stream.delta_frame_bytes.len() > window {
+                stream.delta_frame_bytes.pop_front();
+            }
+            stream.median_delta_frame_bytes = median(&stream.delta_frame_bytes);
+        }
+    }
+
+    /// Queues a packet: RTX ahead of media, so repairs aren't stuck behind
+    /// a keyframe
+    fn enqueue(&mut self, element: &super::Pacer, buffer: gst::Buffer, now: Instant) {
+        let info = self.classify(element, &buffer, now);
+        if info.is_none() {
+            gst::log!(
+                CAT,
+                obj = element,
+                "Not an RTP packet, pacing it without knowing what it is"
+            );
+        }
+        self.queued_bytes += buffer.size() as u64;
+
+        // Packets queued behind a keyframe or large frame get its longer
+        // queue time, and keep it once the frame has left: shortening it
+        // then would leave them overdue and send them as a burst
+        let burst_frame = info
+            .and_then(|info| info.frame)
+            .filter(|uid| self.frame(*uid).is_some_and(Frame::is_burst));
+        let queue_time = if burst_frame.is_some() || self.burst_queued() {
+            self.keyframe_queue_time()
+        } else {
+            self.frame_queue_time()
+        };
+        if let Some(uid) = burst_frame {
+            // A large frame is only found out a few packets in
+            let keyframe_queue_time = self.keyframe_queue_time();
+            for queued in self
+                .media_queue
+                .iter_mut()
+                .rev()
+                .take_while(|q| q.info.and_then(|info| info.frame) == Some(uid))
+            {
+                queued.deadline = queued.deadline.max(queued.enqueued + keyframe_queue_time);
+            }
+        }
+
+        let queued = Queued {
+            buffer,
+            info,
+            enqueued: now,
+            deadline: now + queue_time,
+        };
+        if info.is_some_and(|info| info.kind != Kind::Media) {
+            self.rtx_queue.push_back(queued);
+        } else {
+            self.media_queue.push_back(queued);
+            self.media_enqueued += 1;
+        }
+    }
+
+    /// Queues a serialized event behind the media packets queued so far
+    fn enqueue_event(&mut self, event: gst::Event) {
+        self.events.push_back((self.media_enqueued, event));
+    }
+
+    /// Drops what's queued on flush, except the sticky events that
+    /// downstream needs before the next buffers
+    fn flush(&mut self) {
+        self.rtx_queue.clear();
+        self.media_queue.clear();
+        self.queued_bytes = 0;
+        self.events
+            .retain(|(_, event)| event.is_sticky() && event.type_() != gst::EventType::Eos);
+        for (pos, _) in self.events.iter_mut() {
+            *pos = 0;
+        }
+        self.media_enqueued = 0;
+        self.media_dequeued = 0;
+    }
+
+    /// Moves the events due before the next media packet to `list`
+    fn release_events(&mut self, list: &mut Vec<Output>) {
+        while self
+            .events
+            .front()
+            .is_some_and(|(pos, _)| *pos <= self.media_dequeued)
+        {
+            list.push(Output::Event(self.events.pop_front().unwrap().1));
+        }
+    }
+
+    /// Whether a keyframe or large frame is waiting in the queue
+    fn burst_queued(&self) -> bool {
+        let mut last = None;
+        self.media_queue
+            .iter()
+            .filter_map(|q| q.info.and_then(|info| info.frame))
+            .any(|uid| {
+                if last == Some(uid) {
+                    return false;
+                }
+                last = Some(uid);
+                self.frame(uid).is_some_and(Frame::is_burst)
+            })
+    }
+
+    /// The packets the budget allows sending now, and the events due
+    fn dequeue(&mut self, element: &super::Pacer, now: Instant) -> Vec<Output> {
+        self.roll_stats(now);
+        let elapsed = self.last_push.map_or(Duration::ZERO, |t| now - t);
+        self.last_push = Some(now);
+
+        // Speed up just enough for every packet to leave by its deadline,
+        // rather than send what doesn't fit as a burst
+        let mut rate = self.pacing_rate();
+        let mut ahead_bits = 0.;
+        for queued in self.media_queue.iter() {
+            ahead_bits += queued.buffer.size() as f64 * 8.;
+            let left = queued.deadline.saturating_duration_since(now).max(TICK);
+            rate = rate.max(ahead_bits / left.as_secs_f64());
+        }
+
+        let speeding_up = rate > self.pacing_rate();
+        if speeding_up != self.speeding_up {
+            self.speeding_up = speeding_up;
+            if speeding_up {
+                gst::debug!(
+                    CAT,
+                    obj = element,
+                    "Speeding up to {rate:.0} bit/s (pacing rate {:.0}) to send {} queued bytes \
+                     by their deadlines (keyframe queued: {})",
+                    self.pacing_rate(),
+                    self.queued_bytes,
+                    self.burst_queued(),
+                );
+            } else {
+                gst::debug!(
+                    CAT,
+                    obj = element,
+                    "Back to the pacing rate ({:.0} bit/s), {} bytes queued",
+                    self.pacing_rate(),
+                    self.queued_bytes,
+                );
+            }
+        }
+
+        let mut output = Vec::new();
+        self.dequeue_rtx(element, now, elapsed, &mut output);
+
+        let mut budget = self.budget_offset + rate * elapsed.as_secs_f64();
+        loop {
+            self.release_events(&mut output);
+            if budget <= 0. {
+                break;
+            }
+
+            let Some(queued) = self.media_queue.pop_front() else {
+                break;
+            };
+            self.media_dequeued += 1;
+            budget -= queued.buffer.size() as f64 * 8.;
+            self.send(element, queued, now, &mut output);
+        }
+
+        // Budget left over while the queue is empty doesn't carry beyond a
+        // tick's worth, or the next frame would go out as a burst
+        self.budget_offset = budget.min(rate * TICK.as_secs_f64());
+
+        if !output.is_empty() {
+            gst::trace!(
+                CAT,
+                obj = element,
+                "Sending {} items at {rate:.0} bit/s, {} bytes still queued",
+                output.len(),
+                self.queued_bytes,
+            );
+        }
+
+        output
+    }
+
+    /// Sends the retransmissions their budget allows, and drops those that
+    /// waited too long or repeat one sent within the round-trip time
+    fn dequeue_rtx(
+        &mut self,
+        element: &super::Pacer,
+        now: Instant,
+        elapsed: Duration,
+        output: &mut Vec<Output>,
+    ) {
+        let rtx_rate = self.rtx_rate();
+        self.rtx_budget = (self.rtx_budget + rtx_rate * elapsed.as_secs_f64())
+            .min(rtx_rate * RTX_BUDGET_WINDOW.as_secs_f64());
+        let interval = self.rtt.max(MIN_RTX_INTERVAL);
+
+        while let Some(queued) = self.rtx_queue.front() {
+            let key = queued
+                .info
+                .and_then(|info| info.osn.map(|osn| (info.ssrc, osn)));
+            let stale = now.saturating_duration_since(queued.enqueued) > RTX_MAX_QUEUE_TIME;
+            let drop_reason = if stale {
+                Some("waited too long")
+            } else if key
+                .and_then(|key| self.rtx_sent.get(&key))
+                .is_some_and(|t| now.saturating_duration_since(*t) < interval)
+            {
+                Some("retransmitted within the round-trip time")
+            } else {
+                None
+            };
+
+            if let Some(reason) = drop_reason {
+                let queued = self.rtx_queue.pop_front().unwrap();
+                self.queued_bytes -= queued.buffer.size() as u64;
+                self.rtx_dropped += 1;
+                if stale {
+                    self.stats.rtx_dropped_stale += 1;
+                } else {
+                    self.stats.rtx_dropped_repeat += 1;
+                }
+                gst::log!(
+                    CAT,
+                    obj = element,
+                    "Dropping retransmission of {:?}: {reason} ({} dropped so far)",
+                    key,
+                    self.rtx_dropped,
+                );
+                continue;
+            }
+
+            if self.rtx_budget <= 0. {
+                break;
+            }
+            let queued = self.rtx_queue.pop_front().unwrap();
+            self.rtx_budget -= queued.buffer.size() as f64 * 8.;
+            if let Some(key) = key {
+                self.rtx_sent.insert(key, now);
+            }
+            self.send(element, queued, now, output);
+        }
+    }
+
+    /// Sends a dequeued packet, logging it for feedback
+    fn send(
+        &mut self,
+        element: &super::Pacer,
+        queued: Queued,
+        now: Instant,
+        output: &mut Vec<Output>,
+    ) {
+        self.queued_bytes -= queued.buffer.size() as u64;
+
+        // How long a keyframe sat in the pacer, from its first packet
+        // coming in to its last going out
+        if let Some(frame) = queued
+            .info
+            .filter(|info| info.marker)
+            .and_then(|info| info.frame)
+            .and_then(|uid| self.frame(uid))
+            .filter(|frame| frame.is_burst())
+        {
+            gst::debug!(
+                CAT,
+                obj = element,
+                "{} with RTP timestamp {} ({} bytes) went out over {:?}",
+                if frame.keyframe {
+                    "Keyframe"
+                } else {
+                    "Large frame"
+                },
+                frame.rtp_ts,
+                frame.bytes,
+                now - frame.created,
+            );
+        }
+
+        let pacer_delay = now.saturating_duration_since(queued.enqueued);
+        if let Some(info) = queued.info {
+            let stats = self.stats.kind(info.kind);
+            stats.sent += 1;
+            stats.pacer_delay.push(pacer_delay);
+            if let Some(requested_at) = info.requested_at {
+                stats
+                    .request_delay
+                    .push(now.saturating_duration_since(requested_at));
+            }
+        }
+
+        if let Some(info) = queued.info.filter(|info| info.has_extension) {
+            self.sent.push_back(Sent {
+                index: self.next_index,
+                info,
+                at: now,
+                pacer_delay,
+            });
+            self.next_index += 1;
+        }
+
+        output.push(Output::Buffer(queued.buffer));
+    }
+
+    /// Forgets sent packets, frames and retransmission requests too old to
+    /// matter for feedback or classification
+    /// Keeps the stats in `last_stats` once they span STATS_INTERVAL
+    fn roll_stats(&mut self, now: Instant) {
+        let Some(since) = self.stats.since else {
+            self.stats.since = Some(now);
+            return;
+        };
+        if now.saturating_duration_since(since) < STATS_INTERVAL {
+            return;
+        }
+        self.last_stats =
+            Some(
+                self.stats
+                    .take(now, self.bitrate, self.queued_bytes, self.rtx_dropped),
+            );
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .sent
+            .front()
+            .is_some_and(|s| now - s.at > SENT_LOG_MAX_AGE)
+        {
+            self.sent.pop_front();
+        }
+
+        let oldest_current = self.streams.iter().filter_map(|s| s.current).min();
+        while self.frames.front().is_some_and(|f| {
+            now - f.created > SENT_LOG_MAX_AGE && oldest_current.map_or(true, |uid| f.uid < uid)
+        }) {
+            self.frames.pop_front();
+        }
+
+        while self
+            .rtx_requests
+            .front()
+            .is_some_and(|(_, t)| now - *t > RTX_REQUEST_MAX_AGE)
+        {
+            self.rtx_requests.pop_front();
+        }
+
+        self.rtx_sent
+            .retain(|_, t| now.saturating_duration_since(*t) <= RTX_REQUEST_MAX_AGE);
+    }
+
+    /// Extends a 16-bit TWCC seqnum to 64 bits, relative to the highest
+    /// seen so far
+    fn extend_seqnum(&mut self, seqnum: u16) -> i64 {
+        let extended = match self.twcc_extended_seqnum {
+            None => i64::from(seqnum),
+            Some(last) => last + i64::from(seqnum.wrapping_sub(last as u16) as i16),
+        };
+        self.twcc_extended_seqnum = Some(
+            self.twcc_extended_seqnum
+                .map_or(extended, |last| last.max(extended)),
+        );
+        extended
+    }
+
+    /// Sent packet with the given index in the sent log
+    fn sent_at(&self, index: i64) -> Option<&Sent> {
+        let front = self.sent.front()?.index as i64;
+        let pos = usize::try_from(index - front).ok()?;
+        self.sent.get(pos)
+    }
+
+    /// (matching, mismatching) feedback packets with `offset`, among those
+    /// still in the sent log
+    fn check_offset(&self, packets: &[Feedback], offset: i64) -> (usize, usize) {
+        packets.iter().fold((0, 0), |(matched, mismatched), fb| {
+            match self.sent_at(fb.seqnum - offset) {
+                Some(sent) if sent.info.pt == fb.pt && sent.info.payload_len == fb.size => {
+                    (matched + 1, mismatched)
+                }
+                Some(_) => (matched, mismatched + 1),
+                None => (matched, mismatched),
+            }
+        })
+    }
+
+    /// Finds where `packets` line up with the sent log, preferring the
+    /// offset closest to the previous one (or 0: rtpsession numbers packets
+    /// from 0, and the pacer sees all of them from the start)
+    fn find_offset(&self, packets: &[Feedback]) -> Option<i64> {
+        let expected = self.offset.unwrap_or(0);
+        let anchor = packets.first()?;
+        let fully_matches = |offset: i64| {
+            let (matched, mismatched) = self.check_offset(packets, offset);
+            matched > 0 && mismatched == 0
+        };
+
+        if fully_matches(expected) {
+            return Some(expected);
+        }
+
+        // Full size packets all look the same, so several offsets can match
+        // within a frame
+        self.sent
+            .iter()
+            .filter(|s| s.info.pt == anchor.pt && s.info.payload_len == anchor.size)
+            .map(|s| anchor.seqnum - s.index as i64)
+            .filter(|offset| fully_matches(*offset))
+            .min_by_key(|offset| (offset - expected).abs())
+    }
+
+    /// Adds what feedback says about the packets the pacer can identify to
+    /// the stats: lost or not, and the one-way delay over the path's base
+    fn record_feedback(&mut self, packets: &[Feedback]) {
+        for fb in packets {
+            let owd = fb
+                .remote_ts
+                .map(|remote_ts| remote_ts as i64 - fb.local_ts as i64);
+            if let Some(owd) = owd {
+                self.network_base.update(fb.local_ts as i64, owd);
+            }
+            let Some(kind) = self
+                .offset
+                .and_then(|offset| self.sent_at(fb.seqnum - offset))
+                .map(|sent| sent.info)
+                .filter(|info| info.pt == fb.pt && info.payload_len == fb.size)
+                .map(|info| info.kind)
+            else {
+                continue;
+            };
+            let base = self.network_base.get();
+            let stats = self.stats.kind(kind);
+            stats.reported += 1;
+            if fb.lost {
+                stats.lost += 1;
+            } else if let (Some(owd), Some(base)) = (owd, base) {
+                stats.network_delay.push_ns(owd - base);
+            }
+        }
+    }
+
+    /// Annotates the packets of an `RTPTWCCPackets` event with what the
+    /// pacer knows about them
+    fn on_feedback(
+        &mut self,
+        element: &super::Pacer,
+        structure: &gst::StructureRef,
+    ) -> Option<gst::Structure> {
+        let now = Instant::now();
+        self.prune(now);
+
+        let varray = structure.get::<glib::ValueArray>("packets").ok()?;
+        let packets = varray
+            .iter()
+            .filter_map(|v| v.get::<gst::Structure>().ok())
+            .filter_map(|s| Feedback::from_structure(&s))
+            .map(|(seqnum, fb)| Feedback {
+                seqnum: self.extend_seqnum(seqnum),
+                ..fb
+            })
+            .collect::<Vec<_>>();
+        if packets.is_empty() {
+            return None;
+        }
+
+        let lined_up = self.offset.is_some_and(|offset| {
+            let (matched, mismatched) = self.check_offset(&packets, offset);
+            mismatched == 0 || matched >= 3 * mismatched
+        });
+        if !lined_up {
+            let offset = self.find_offset(&packets);
+            if offset.is_none() && self.offset.is_some() {
+                gst::warning!(
+                    CAT,
+                    obj = element,
+                    "TWCC feedback no longer lines up with the sent packets (was at offset {:?}), \
+                     reporting them as unknown",
+                    self.offset
+                );
+            } else if offset != self.offset {
+                gst::debug!(
+                    CAT,
+                    obj = element,
+                    "TWCC feedback lines up with sent packets at offset {offset:?} (was {:?})",
+                    self.offset
+                );
+            }
+            self.offset = offset;
+        }
+
+        self.record_feedback(&packets);
+
+        let annotated = packets
+            .iter()
+            .map(|fb| {
+                let sent = self
+                    .offset
+                    .and_then(|offset| self.sent_at(fb.seqnum - offset))
+                    .filter(|sent| sent.info.pt == fb.pt && sent.info.payload_len == fb.size);
+                let info = sent.map(|sent| sent.info);
+
+                let mut s = gst::Structure::builder("RTPPacerPacket")
+                    .field("twcc-seqnum", fb.seqnum)
+                    .field("local-ts", fb.local_ts)
+                    .field("size", fb.size)
+                    .field("lost", fb.lost)
+                    .field("payload-type", u32::from(fb.pt));
+                if let Some(remote_ts) = fb.remote_ts {
+                    s = s.field("remote-ts", remote_ts);
+                }
+
+                if let Some(sent) = sent {
+                    s = s.field("pacer-delay", sent.pacer_delay.as_nanos() as u64);
+                }
+
+                s = match info {
+                    None => s.field("kind", "unknown"),
+                    Some(info) => {
+                        let mut s = s
+                            .field("kind", info.kind.as_str())
+                            .field("ssrc", info.ssrc)
+                            .field("rtp-seqnum", u32::from(info.seqnum))
+                            .field("rtp-timestamp", info.rtp_ts)
+                            .field("marker", info.marker);
+                        if let Some(osn) = info.osn {
+                            s = s.field("osn", u32::from(osn));
+                        }
+                        match info.frame.and_then(|uid| self.frame(uid)) {
+                            Some(frame) => s
+                                .field("frame-start", info.frame_start)
+                                .field("keyframe", frame.keyframe)
+                                .field("keyframe-requested", frame.requested)
+                                .field("large-frame", frame.large)
+                                .field("frame-size", frame.bytes)
+                                .field("frame-packets", frame.packets),
+                            None => s,
+                        }
+                    }
+                };
+
+                s.build().to_send_value()
+            })
+            .collect::<gst::Array>();
+
+        let (matched, _) = self
+            .offset
+            .map_or((0, 0), |offset| self.check_offset(&packets, offset));
+        gst::log!(
+            CAT,
+            obj = element,
+            "Feedback for {} packets (TWCC {}..={}): {matched} identified, {} lost",
+            packets.len(),
+            packets.first().map_or(0, |fb| fb.seqnum),
+            packets.last().map_or(0, |fb| fb.seqnum),
+            packets.iter().filter(|fb| fb.lost).count(),
+        );
+
+        Some(
+            gst::Structure::builder("RTPPacerFeedback")
+                .field("packets", annotated)
+                .field("framerate", self.framerate)
+                .field("gop-size", self.gop_size)
+                .build(),
+        )
+    }
+}
+
+pub struct Pacer {
+    /// Everything the chain function, srcpad task and events share
+    state: Mutex<State>,
+
+    /// Pushes paced packets, receives TWCC and retransmission events
+    srcpad: gst::Pad,
+    /// Receives RTP packets from rtprtxsend
+    sinkpad: gst::Pad,
+}
+
+impl Pacer {
+    /// Pushes dequeued buffers and events downstream, in order, stopping at
+    /// the first flow error
+    fn push_list(&self, list: Vec<Output>) -> Result<gst::FlowSuccess, gst::FlowError> {
+        let mut res = Ok(gst::FlowSuccess::Ok);
+        for output in list {
+            match output {
+                Output::Buffer(buf) => res = self.srcpad.push(buf),
+                Output::Event(event) => {
+                    let _ = self.srcpad.push_event(event);
+                }
+            }
+            if res.is_err() {
+                break;
+            }
+        }
+
+        self.state.lock().unwrap().flow_return = res;
+
+        res
+    }
+
+    /// Starts the srcpad task that dequeues every TICK on the system clock
+    fn start_task(&self) -> Result<(), glib::BoolError> {
+        let weak_pacer = self.obj().downgrade();
+        let weak_pad = self.srcpad.downgrade();
+        let clock = gst::SystemClock::obtain();
+        let tick = gst::ClockTime::from_nseconds(TICK.as_nanos() as u64);
+
+        self.state.lock().unwrap().clock_entry =
+            Some(clock.new_single_shot_id(clock.time().unwrap() + tick));
+
+        self.srcpad.start_task(move || {
+            let pause = || {
+                if let Some(pad) = weak_pad.upgrade() {
+                    let _ = pad.pause_task();
+                }
+            };
+            let pacer = weak_pacer
+                .upgrade()
+                .expect("pacer destroyed while its srcpad task is still running?");
+            let imp = pacer.imp();
+
+            let Some(clock_entry) = imp.state.lock().unwrap().clock_entry.take() else {
+                gst::info!(
+                    CAT,
+                    obj = pacer,
+                    "Pausing task as our clock entry is not set anymore"
+                );
+                return pause();
+            };
+
+            if let (Err(err), _) = clock_entry.wait() {
+                if err != gst::ClockError::Early {
+                    gst::error!(
+                        CAT,
+                        obj = pacer,
+                        "Got error {err:?} on the clock, pausing task"
+                    );
+                    imp.state.lock().unwrap().flow_return = Err(gst::FlowError::Flushing);
+                    return pause();
+                }
+            }
+
+            let list = {
+                let mut state = imp.state.lock().unwrap();
+                clock
+                    .single_shot_id_reinit(&clock_entry, clock.time().unwrap() + tick)
+                    .unwrap();
+                state.clock_entry = Some(clock_entry);
+                state.dequeue(&pacer, Instant::now())
+            };
+
+            if !list.is_empty() {
+                if let Err(err) = imp.push_list(list) {
+                    if err != gst::FlowError::Flushing {
+                        gst::error!(CAT, obj = pacer, "pause task, reason: {err:?}");
+                    }
+                    pause()
+                }
+            }
+        })
+    }
+
+    /// Starts the task on activation; stops it and drops the queue on
+    /// deactivation
+    fn src_activatemode(&self, mode: gst::PadMode, active: bool) -> Result<(), gst::LoggableError> {
+        if mode != gst::PadMode::Push {
+            return Err(gst::loggable_error!(CAT, "Unsupported pad mode {mode:?}"));
+        }
+
+        if active {
+            self.state.lock().unwrap().flow_return = Ok(gst::FlowSuccess::Ok);
+            self.start_task()?;
+        } else {
+            let mut state = self.state.lock().unwrap();
+            state.flow_return = Err(gst::FlowError::Flushing);
+            state.flush();
+            drop(state);
+
+            self.srcpad.stop_task()?;
+        }
+
+        Ok(())
+    }
+
+    /// Flushes the queue on flush-start and keeps serialized events in order
+    /// with the queued packets
+    fn sink_event(&self, pad: &gst::Pad, event: gst::Event) -> bool {
+        match event.type_() {
+            gst::EventType::FlushStart => {
+                gst::debug!(CAT, imp = self, "Flushing, dropping the queued packets");
+                self.state.lock().unwrap().flush()
+            }
+            gst::EventType::FlushStop => (),
+            // Behind the queued packets, or EOS would cut off the end of
+            // the stream
+            _ if event.is_serialized() => {
+                let mut state = self.state.lock().unwrap();
+                if event.type_() == gst::EventType::Eos {
+                    gst::debug!(
+                        CAT,
+                        imp = self,
+                        "EOS queued behind {} bytes",
+                        state.queued_bytes
+                    );
+                }
+                state.enqueue_event(event);
+                return true;
+            }
+            _ => (),
+        }
+
+        gst::Pad::event_default(pad, Some(&*self.obj()), event)
+    }
+
+    /// Turns TWCC feedback into `packet-feedback` signals and records
+    /// retransmission requests, then forwards upstream
+    fn src_event(&self, pad: &gst::Pad, event: gst::Event) -> bool {
+        if let Some(structure) = event.structure() {
+            match structure.name().as_str() {
+                "RTPTWCCPackets" => {
+                    let feedback = self
+                        .state
+                        .lock()
+                        .unwrap()
+                        .on_feedback(&self.obj(), structure);
+                    // Not holding the lock, handlers set properties on us
+                    if let Some(feedback) = feedback {
+                        self.obj()
+                            .emit_by_name::<()>("packet-feedback", &[&feedback]);
+                    }
+                }
+                "GstRTPRetransmissionRequest" => {
+                    if let Ok(seqnum) = structure.get::<u32>("seqnum") {
+                        gst::trace!(
+                            CAT,
+                            imp = self,
+                            "Retransmission requested for {seqnum} (ssrc {:?})",
+                            structure.get::<u32>("ssrc").ok()
+                        );
+                        let now = Instant::now();
+                        let mut state = self.state.lock().unwrap();
+                        state.prune(now);
+                        state.rtx_requests.push_back((seqnum as u16, now));
+                    }
+                }
+                _ => (),
+            }
+        }
+
+        gst::Pad::event_default(pad, Some(&*self.obj()), event)
+    }
+}
+
+#[glib::object_subclass]
+impl ObjectSubclass for Pacer {
+    const NAME: &'static str = "GstRtpPacer";
+    type Type = super::Pacer;
+    type ParentType = gst::Element;
+
+    fn with_class(klass: &Self::Class) -> Self {
+        let templ = klass.pad_template("sink").unwrap();
+        let sinkpad = gst::Pad::builder_from_template(&templ)
+            .chain_function(|_pad, parent, buffer| {
+                Pacer::catch_panic_pad_function(
+                    parent,
+                    || Err(gst::FlowError::Error),
+                    |this| {
+                        let mut state = this.state.lock().unwrap();
+                        state.enqueue(&this.obj(), buffer, Instant::now());
+                        state.flow_return
+                    },
+                )
+            })
+            .event_function(|pad, parent, event| {
+                Pacer::catch_panic_pad_function(
+                    parent,
+                    || false,
+                    |this| this.sink_event(pad, event),
+                )
+            })
+            .flags(gst::PadFlags::PROXY_CAPS | gst::PadFlags::PROXY_ALLOCATION)
+            .build();
+
+        let templ = klass.pad_template("src").unwrap();
+        let srcpad = gst::Pad::builder_from_template(&templ)
+            .event_function(|pad, parent, event| {
+                Pacer::catch_panic_pad_function(parent, || false, |this| this.src_event(pad, event))
+            })
+            .activatemode_function(|_pad, parent, mode, active| {
+                Pacer::catch_panic_pad_function(
+                    parent,
+                    || {
+                        Err(gst::loggable_error!(
+                            CAT,
+                            "Panic activating src pad with mode"
+                        ))
+                    },
+                    |this| this.src_activatemode(mode, active),
+                )
+            })
+            .flags(gst::PadFlags::PROXY_CAPS | gst::PadFlags::PROXY_ALLOCATION)
+            .build();
+
+        Self {
+            state: Default::default(),
+            srcpad,
+            sinkpad,
+        }
+    }
+}
+
+impl ObjectImpl for Pacer {
+    fn constructed(&self) {
+        self.parent_constructed();
+
+        let obj = self.obj();
+        obj.add_pad(&self.sinkpad).unwrap();
+        obj.add_pad(&self.srcpad).unwrap();
+    }
+
+    fn properties() -> &'static [glib::ParamSpec] {
+        static PROPERTIES: Lazy<Vec<glib::ParamSpec>> = Lazy::new(|| {
+            vec![
+                glib::ParamSpecUInt::builder("bitrate")
+                    .nick("Bitrate")
+                    .blurb("Target bitrate of the stream, in bit/sec, the pacing rate is derived from")
+                    .minimum(1)
+                    .default_value(DEFAULT_BITRATE)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecDouble::builder("pacing-factor")
+                    .nick("Pacing Factor")
+                    .blurb("Packets are sent at this many times the bitrate")
+                    .minimum(1.)
+                    .maximum(10.)
+                    .default_value(DEFAULT_PACING_FACTOR)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecDouble::builder("framerate")
+                    .nick("Framerate")
+                    .blurb("Framerate of the stream, the queue holds at most one frame interval of data (a few while a keyframe is queued)")
+                    .minimum(1.)
+                    .maximum(1000.)
+                    .default_value(DEFAULT_FRAMERATE)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecUInt::builder("gop-size")
+                    .nick("GOP Size")
+                    .blurb("Frames between periodic keyframes, 0 if unknown: a queued keyframe may take at most half a GOP to drain, and keyframes before the GOP is over are reported as requested")
+                    .default_value(DEFAULT_GOP_SIZE)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecBoxed::builder::<gst::Structure>("rtx-payload-type-map")
+                    .nick("RTX Payload Type Map")
+                    .blurb("Map of original payload types to RTX payload types, as rtprtxsend's payload-type-map")
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecDouble::builder("rtx-max-ratio")
+                    .nick("RTX Max Ratio")
+                    .blurb("Retransmissions may take at most this many times the bitrate, on top of it")
+                    .minimum(0.)
+                    .maximum(10.)
+                    .default_value(DEFAULT_RTX_MAX_RATIO)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecUInt64::builder("rtt")
+                    .nick("Round-trip time")
+                    .blurb("Round-trip time in nanoseconds, a packet isn't retransmitted again within it (at least 50 ms), 0 if unknown")
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecUInt64::builder("rtx-dropped")
+                    .nick("RTX Dropped")
+                    .blurb("Retransmissions dropped for waiting too long or repeating one within the round-trip time")
+                    .read_only()
+                    .build(),
+                glib::ParamSpecBoxed::builder::<gst::Structure>("stats")
+                    .nick("Stats")
+                    .blurb("RTPPacerStats of the last second: per kind of packet (media, rtx-repair, rtx-padding), packets sent, reported and lost by feedback, and the mean, 95th percentile and max in microseconds of the time spent in the pacer, from the retransmission request (rtx-repair) and on the path over its lowest one-way delay; retransmissions dropped")
+                    .read_only()
+                    .build(),
+                glib::ParamSpecUInt64::builder("queued-bytes")
+                    .nick("Queued Bytes")
+                    .blurb("Bytes waiting in the pacer's queue")
+                    .read_only()
+                    .build(),
+            ]
+        });
+
+        PROPERTIES.as_ref()
+    }
+
+    fn signals() -> &'static [glib::subclass::Signal] {
+        static SIGNALS: Lazy<Vec<glib::subclass::Signal>> = Lazy::new(|| {
+            vec![
+                /*
+                 * rtppacer::packet-feedback:
+                 * @feedback: an `RTPPacerFeedback` structure, its `packets`
+                 * array holding one `RTPPacerPacket` per packet of the TWCC
+                 * feedback, with what the pacer knows about it
+                 *
+                 * Emitted from the streaming thread of the feedback, without
+                 * the pacer's lock held.
+                 */
+                glib::subclass::Signal::builder("packet-feedback")
+                    .param_types([gst::Structure::static_type()])
+                    .build(),
+            ]
+        });
+
+        SIGNALS.as_ref()
+    }
+
+    fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+        let mut state = self.state.lock().unwrap();
+        match pspec.name() {
+            "bitrate" => {
+                let bitrate = value.get().expect("type checked upstream");
+                gst::log!(
+                    CAT,
+                    imp = self,
+                    "Bitrate {} -> {bitrate}, pacing at {:.0} bit/s",
+                    state.bitrate,
+                    f64::from(bitrate) * state.pacing_factor
+                );
+                state.bitrate = bitrate;
+            }
+            "pacing-factor" => {
+                state.pacing_factor = value.get().expect("type checked upstream");
+                gst::info!(CAT, imp = self, "Pacing factor {}", state.pacing_factor);
+            }
+            "framerate" => {
+                state.framerate = value.get().expect("type checked upstream");
+                gst::info!(
+                    CAT,
+                    imp = self,
+                    "Framerate {}: queue time {:?}, {:?} with a keyframe queued",
+                    state.framerate,
+                    state.frame_queue_time(),
+                    state.keyframe_queue_time()
+                );
+            }
+            "gop-size" => {
+                state.gop_size = value.get().expect("type checked upstream");
+                gst::info!(
+                    CAT,
+                    imp = self,
+                    "GOP size {}: queue time {:?} with a keyframe queued",
+                    state.gop_size,
+                    state.keyframe_queue_time()
+                );
+            }
+            "rtx-max-ratio" => {
+                state.rtx_max_ratio = value.get().expect("type checked upstream");
+                gst::info!(CAT, imp = self, "RTX max ratio {}", state.rtx_max_ratio);
+            }
+            "rtt" => {
+                let rtt = Duration::from_nanos(value.get().expect("type checked upstream"));
+                gst::log!(CAT, imp = self, "Round-trip time {rtt:?}");
+                state.rtt = rtt;
+            }
+            "rtx-payload-type-map" => {
+                state.set_rtx_pt_map(value.get().expect("type checked upstream"));
+                gst::info!(
+                    CAT,
+                    imp = self,
+                    "RTX payload types {:?} from {:?}",
+                    state.rtx_pts,
+                    state.rtx_pt_map
+                );
+            }
+            _ => unimplemented!(),
+        }
+    }
+
+    fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
+        let state = self.state.lock().unwrap();
+        match pspec.name() {
+            "bitrate" => state.bitrate.to_value(),
+            "pacing-factor" => state.pacing_factor.to_value(),
+            "framerate" => state.framerate.to_value(),
+            "gop-size" => state.gop_size.to_value(),
+            "rtx-payload-type-map" => state.rtx_pt_map.to_value(),
+            "rtx-max-ratio" => state.rtx_max_ratio.to_value(),
+            "rtt" => (state.rtt.as_nanos() as u64).to_value(),
+            "rtx-dropped" => state.rtx_dropped.to_value(),
+            "queued-bytes" => state.queued_bytes.to_value(),
+            "stats" => state
+                .last_stats
+                .clone()
+                .unwrap_or_else(|| gst::Structure::new_empty("RTPPacerStats"))
+                .to_value(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl GstObjectImpl for Pacer {}
+
+impl ElementImpl for Pacer {
+    fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
+        static ELEMENT_METADATA: Lazy<gst::subclass::ElementMetadata> = Lazy::new(|| {
+            gst::subclass::ElementMetadata::new(
+                "RTP pacer",
+                "Network/WebRTC/RTP/Filter",
+                "Paces RTP packets, keyframe and retransmission aware, and annotates \
+                 the transport-wide congestion control feedback per packet",
+                "viotov <viotov@moveparallel.com>",
+            )
+        });
+
+        Some(&*ELEMENT_METADATA)
+    }
+
+    fn pad_templates() -> &'static [gst::PadTemplate] {
+        static PAD_TEMPLATES: Lazy<Vec<gst::PadTemplate>> = Lazy::new(|| {
+            let caps = gst::Caps::builder_full()
+                .structure(gst::Structure::builder("application/x-rtp").build())
+                .build();
+
+            vec![
+                gst::PadTemplate::new(
+                    "sink",
+                    gst::PadDirection::Sink,
+                    gst::PadPresence::Always,
+                    &caps,
+                )
+                .unwrap(),
+                gst::PadTemplate::new(
+                    "src",
+                    gst::PadDirection::Src,
+                    gst::PadPresence::Always,
+                    &caps,
+                )
+                .unwrap(),
+            ]
+        });
+
+        PAD_TEMPLATES.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gst_rtp::prelude::*;
+
+    fn init() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| gst::init().unwrap());
+    }
+
+    /// A pacer element, for log context
+    fn element() -> super::super::Pacer {
+        init();
+        glib::Object::new()
+    }
+
+    /// RTP packet with a header extension (so it gets a TWCC seqnum), and
+    /// for RTX the sequence number it carries
+    fn rtp_buffer(
+        pt: u8,
+        seqnum: u16,
+        ts: u32,
+        payload_len: u32,
+        marker: bool,
+        delta: bool,
+        osn: Option<u16>,
+    ) -> gst::Buffer {
+        let mut buffer = gst::Buffer::new_rtp_with_sizes(payload_len, 0, 0).unwrap();
+        {
+            let buffer = buffer.get_mut().unwrap();
+            let mut rtp = gst_rtp::RTPBuffer::from_buffer_writable(buffer).unwrap();
+            rtp.set_payload_type(pt);
+            rtp.set_seq(seqnum);
+            rtp.set_timestamp(ts);
+            rtp.set_ssrc(0x1234);
+            rtp.set_marker(marker);
+            if let Some(osn) = osn {
+                rtp.payload_mut().unwrap()[..2].copy_from_slice(&osn.to_be_bytes());
+            }
+            rtp.add_extension_onebyte_header(1, &[0, 0]).unwrap();
+            drop(rtp);
+            if delta {
+                buffer.set_flags(gst::BufferFlags::DELTA_UNIT);
+            }
+        }
+        buffer
+    }
+
+    /// Queues a frame of `packets` packets of `size` bytes
+    fn frame(state: &mut State, seqnum: &mut u16, ts: u32, packets: u32, size: u32, delta: bool) {
+        frame_at(state, seqnum, ts, packets, size, delta, Instant::now());
+    }
+
+    /// Same, queued at `at`
+    fn frame_at(
+        state: &mut State,
+        seqnum: &mut u16,
+        ts: u32,
+        packets: u32,
+        size: u32,
+        delta: bool,
+        at: Instant,
+    ) {
+        for i in 0..packets {
+            state.enqueue(
+                &element(),
+                rtp_buffer(96, *seqnum, ts, size, i + 1 == packets, delta, None),
+                at,
+            );
+            *seqnum += 1;
+        }
+    }
+
+    #[test]
+    fn queue_times_follow_framerate_and_gop() {
+        let mut state = State::default();
+        // 10 fps, GOP 25
+        assert_eq!(state.frame_queue_time(), Duration::from_millis(100));
+        assert_eq!(state.keyframe_queue_time(), Duration::from_millis(300));
+
+        // a short GOP caps the keyframe queue at half of it
+        state.gop_size = 4;
+        assert_eq!(state.keyframe_queue_time(), Duration::from_millis(200));
+
+        // high framerates keep MIN_PACING_QUEUE
+        state.framerate = 60.;
+        state.gop_size = 0;
+        assert_eq!(state.frame_queue_time(), MIN_PACING_QUEUE);
+        assert_eq!(state.keyframe_queue_time(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn keyframes_and_large_frames() {
+        init();
+        // low enough for the frame sizes alone to tell large frames apart
+        let mut state = State {
+            bitrate: 100_000,
+            ..Default::default()
+        };
+        let mut seqnum = 0;
+
+        frame(&mut state, &mut seqnum, 0, 10, 1000, false);
+        for i in 1..5 {
+            frame(&mut state, &mut seqnum, i * 9000, 2, 1000, true);
+        }
+        // an unflagged intra frame, sized like one
+        frame(&mut state, &mut seqnum, 5 * 9000, 8, 1000, true);
+        // a keyframe before the GOP is over
+        frame(&mut state, &mut seqnum, 6 * 9000, 10, 1000, false);
+
+        let frames = state.frames.iter().collect::<Vec<_>>();
+        assert!(frames[0].keyframe && !frames[0].requested);
+        assert!(frames[1..5].iter().all(|f| !f.is_burst()));
+        assert!(!frames[5].keyframe && frames[5].large);
+        assert!(frames[6].keyframe && frames[6].requested);
+        // the large frame counts towards the median, without moving it
+        assert_eq!(state.streams[0].median_delta_frame_bytes, Some(2000.));
+        assert!(state.burst_queued());
+    }
+
+    /// Queues `count` delta frames of `packets` packets of `size` bytes
+    /// after frame `*n`, returning whether each was a large frame
+    fn delta_frames(
+        state: &mut State,
+        seqnum: &mut u16,
+        n: &mut u32,
+        count: u32,
+        packets: u32,
+        size: u32,
+    ) -> Vec<bool> {
+        (0..count)
+            .map(|_| {
+                *n += 1;
+                frame(state, seqnum, *n * 9000, packets, size, true);
+                state.frames.back().unwrap().large
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tiny_frames_at_start_do_not_make_every_frame_large() {
+        init();
+        for bitrate in [1_260_000, 500_000] {
+            let mut state = State {
+                bitrate,
+                gop_size: 10,
+                ..Default::default()
+            };
+            let (mut seqnum, mut n) = (0, 0);
+
+            // a static scene before the cameras are up, then real video
+            frame(&mut state, &mut seqnum, 0, 10, 1000, false);
+            delta_frames(&mut state, &mut seqnum, &mut n, 30, 1, 125);
+            let large = delta_frames(&mut state, &mut seqnum, &mut n, 50, 14, 1200);
+
+            if bitrate == 1_260_000 {
+                // under 1.5 frame intervals at the bitrate: never large
+                assert!(large.iter().all(|large| !large), "{large:?}");
+            } else {
+                // the median takes over within half a GOP
+                assert!(large[6..].iter().all(|large| !large), "{large:?}");
+            }
+            assert_eq!(state.streams[0].median_delta_frame_bytes, Some(16800.));
+        }
+    }
+
+    #[test]
+    fn growing_frames_are_never_large() {
+        init();
+        // the bitrate out of the way: the median alone keeps up
+        let mut state = State {
+            bitrate: 100_000,
+            gop_size: 25,
+            ..Default::default()
+        };
+        let (mut seqnum, mut n) = (0, 0);
+
+        frame(&mut state, &mut seqnum, 0, 10, 1000, false);
+        // 8% larger every second, from 1 to 5 Mbps worth of frames
+        let mut size = 1_000_000. / 8. / 10.;
+        while size < 5_000_000. / 8. / 10. {
+            let large = delta_frames(&mut state, &mut seqnum, &mut n, 10, 10, (size / 10.) as u32);
+            assert!(large.iter().all(|large| !large), "{size}: {large:?}");
+            size *= 1.08;
+        }
+    }
+
+    #[test]
+    fn large_frame_in_a_static_scene() {
+        init();
+        let mut state = State {
+            bitrate: 1_260_000,
+            gop_size: 25,
+            ..Default::default()
+        };
+        let (mut seqnum, mut n) = (0, 0);
+
+        frame(&mut state, &mut seqnum, 0, 10, 1000, false);
+        delta_frames(&mut state, &mut seqnum, &mut n, 20, 2, 1000);
+        // 15x the usual frame and over 1.5 frame intervals at the bitrate
+        let large = delta_frames(&mut state, &mut seqnum, &mut n, 1, 25, 1200);
+        assert_eq!(large, [true]);
+        let large = delta_frames(&mut state, &mut seqnum, &mut n, 5, 2, 1000);
+        assert!(large.iter().all(|large| !large));
+        assert_eq!(state.streams[0].median_delta_frame_bytes, Some(2000.));
+    }
+
+    #[test]
+    fn rtx_skips_ahead_and_is_classified() {
+        init();
+        let mut state = State::default();
+        state.set_rtx_pt_map(Some(
+            gst::Structure::builder("application/x-rtp-pt-map")
+                .field("96", 97u32)
+                .build(),
+        ));
+        let mut seqnum = 0;
+        frame(&mut state, &mut seqnum, 0, 3, 1000, false);
+
+        // a NACK for packet 1: its retransmission repairs, one of packet 7
+        // (never asked for) is padding
+        state.rtx_requests.push_back((1, Instant::now()));
+        state.enqueue(
+            &element(),
+            rtp_buffer(97, 0, 0, 1002, false, false, Some(1)),
+            Instant::now(),
+        );
+        state.enqueue(
+            &element(),
+            rtp_buffer(97, 1, 0, 1002, false, false, Some(7)),
+            Instant::now(),
+        );
+
+        let start = Instant::now();
+        state.last_push = Some(start);
+        let sent = state.dequeue(&element(), start + Duration::from_millis(100));
+        assert_eq!(sent.len(), 5);
+        let kinds = state.sent.iter().map(|s| s.info.kind).collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                Kind::RtxRepair,
+                Kind::RtxPadding,
+                Kind::Media,
+                Kind::Media,
+                Kind::Media
+            ]
+        );
+    }
+
+    /// Queues retransmissions of `osns`, requested, at `at`
+    fn rtx_at(state: &mut State, rtx_seqnum: &mut u16, osns: &[u16], at: Instant) {
+        for &osn in osns {
+            state.rtx_requests.push_back((osn, at));
+            state.enqueue(
+                &element(),
+                rtp_buffer(97, *rtx_seqnum, 0, 1200, false, false, Some(osn)),
+                at,
+            );
+            *rtx_seqnum = rtx_seqnum.wrapping_add(1);
+        }
+    }
+
+    fn rtx_state() -> State {
+        let mut state = State {
+            bitrate: 2_000_000,
+            ..Default::default()
+        };
+        state.set_rtx_pt_map(Some(
+            gst::Structure::builder("application/x-rtp-pt-map")
+                .field("96", 97u32)
+                .build(),
+        ));
+        state
+    }
+
+    #[test]
+    fn retransmissions_are_limited_to_their_budget() {
+        // As in hitl1105: requests for ~1300 packets/s against a 2 Mbps
+        // stream. At most rtx-max-ratio x bitrate goes out, the rest is
+        // dropped once stale rather than sent all at once later.
+        init();
+        let mut state = rtx_state();
+        let start = Instant::now();
+        state.last_push = Some(start);
+        let mut rtx_seqnum = 0;
+        let mut t = start;
+        let mut sent_bits = 0.;
+        for i in 0..400u32 {
+            t += TICK;
+            // ~6.5 requests per 5 ms tick, each for a different packet
+            let osns: Vec<u16> = (0..7).map(|j| (i * 7 + j) as u16).collect();
+            rtx_at(&mut state, &mut rtx_seqnum, &osns, t);
+            for out in state.dequeue(&element(), t) {
+                if let Output::Buffer(b) = out {
+                    sent_bits += b.size() as f64 * 8.;
+                }
+            }
+        }
+        let secs = (t - start).as_secs_f64();
+        let rate = sent_bits / secs;
+        // 1 Mbps, plus at most the budget window saved up at the start
+        assert!(rate <= 1.05e6, "{rate:.0} bit/s of retransmissions");
+        assert!(rate >= 0.9e6, "{rate:.0} bit/s of retransmissions");
+        assert!(state.rtx_dropped > 0);
+        // nothing older than RTX_MAX_QUEUE_TIME is left waiting
+        assert!(state
+            .rtx_queue
+            .iter()
+            .all(|q| t - q.enqueued <= RTX_MAX_QUEUE_TIME));
+    }
+
+    #[test]
+    fn repeated_requests_within_the_rtt_are_dropped() {
+        init();
+        let mut state = rtx_state();
+        state.rtt = Duration::from_millis(100);
+        let start = Instant::now();
+        state.last_push = Some(start);
+        let mut rtx_seqnum = 0;
+
+        rtx_at(&mut state, &mut rtx_seqnum, &[5], start);
+        assert_eq!(state.dequeue(&element(), start + TICK * 4).len(), 1);
+        // asked again before the retransmission could have arrived
+        let t = start + Duration::from_millis(60);
+        rtx_at(&mut state, &mut rtx_seqnum, &[5], t);
+        assert_eq!(state.dequeue(&element(), t + TICK).len(), 0);
+        assert_eq!(state.rtx_dropped, 1);
+        // asked again after a round trip: the retransmission was lost
+        let t = start + Duration::from_millis(150);
+        rtx_at(&mut state, &mut rtx_seqnum, &[5], t);
+        assert_eq!(state.dequeue(&element(), t + TICK * 4).len(), 1);
+    }
+
+    #[test]
+    fn pacing_speeds_up_to_drain_a_keyframe_in_time() {
+        init();
+        let mut state = State {
+            bitrate: 1_000_000,
+            pacing_factor: 1.,
+            ..Default::default()
+        };
+        let mut seqnum = 0;
+        // 120 kB keyframe: 0.96 s at 1 Mbps, must be through in 300 ms
+        frame(&mut state, &mut seqnum, 0, 100, 1200, false);
+
+        let start = Instant::now();
+        state.last_push = Some(start);
+        let mut t = start;
+        let mut sent = 0;
+        while sent < 100 {
+            t += TICK;
+            sent += state.dequeue(&element(), t).len();
+            assert!(
+                t - start < Duration::from_millis(320),
+                "still {} queued",
+                100 - sent
+            );
+        }
+        // and didn't go out at once
+        assert!(t - start > Duration::from_millis(250));
+    }
+
+    #[test]
+    fn delta_frames_behind_a_keyframe_are_not_burst_out_after_it() {
+        init();
+        let mut state = State {
+            bitrate: 1_000_000,
+            pacing_factor: 1.,
+            ..Default::default()
+        };
+        let mut seqnum = 0;
+        let start = Instant::now();
+        state.last_push = Some(start);
+        // 60 kB keyframe: 480 ms at 1 Mbps, must be through in 300 ms
+        frame_at(&mut state, &mut seqnum, 0, 50, 1200, false, start);
+
+        let mut t = start;
+        let mut sent = 0;
+        while sent < 50 + 2 * 5 {
+            t += TICK;
+            // Delta frames coming in while the keyframe is still queued
+            for (i, at) in [100, 200].into_iter().enumerate() {
+                if t - start == Duration::from_millis(at) {
+                    frame_at(
+                        &mut state,
+                        &mut seqnum,
+                        9000 * (i as u32 + 1),
+                        5,
+                        1000,
+                        true,
+                        t,
+                    );
+                }
+            }
+            let n = state.dequeue(&element(), t).len();
+            // Keyframe pace is 1.6 Mbps, a packet per tick: no catching up
+            // on overdue delta frames once it's out
+            assert!(n <= 2, "{n} packets sent at once after {:?}", t - start);
+            sent += n;
+            assert!(t - start < Duration::from_millis(520));
+        }
+    }
+
+    #[test]
+    fn eos_waits_for_the_queued_packets() {
+        init();
+        let mut state = State::default();
+        let mut seqnum = 0;
+        frame(&mut state, &mut seqnum, 0, 3, 1000, false);
+        state.enqueue_event(gst::event::Eos::new());
+
+        let start = Instant::now();
+        state.last_push = Some(start);
+        // budget for a single packet: the EOS stays queued
+        let out = state.dequeue(&element(), start + Duration::from_millis(1));
+        assert!(matches!(out.as_slice(), [Output::Buffer(_)]));
+        let out = state.dequeue(&element(), start + Duration::from_secs(1));
+        assert!(matches!(
+            out.as_slice(),
+            [Output::Buffer(_), Output::Buffer(_), Output::Event(_)]
+        ));
+    }
+
+    /// Logs packets of `sizes` as sent, with TWCC extensions
+    fn sent(state: &mut State, sizes: &[u32]) {
+        let now = Instant::now();
+        for size in sizes {
+            state.sent.push_back(Sent {
+                index: state.next_index,
+                info: PacketInfo {
+                    pt: 96,
+                    ssrc: 0,
+                    seqnum: state.next_index as u16,
+                    rtp_ts: 0,
+                    marker: false,
+                    payload_len: *size,
+                    has_extension: true,
+                    kind: Kind::Media,
+                    frame: None,
+                    frame_start: false,
+                    osn: None,
+                    requested_at: None,
+                },
+                at: now,
+                pacer_delay: Duration::ZERO,
+            });
+            state.next_index += 1;
+        }
+    }
+
+    /// TWCC feedback for packets of `sizes`, starting at TWCC seqnum `first`
+    fn feedback(first: i64, sizes: &[u32]) -> Vec<Feedback> {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(i, size)| Feedback {
+                seqnum: first + i as i64,
+                local_ts: 0,
+                remote_ts: Some(0),
+                pt: 96,
+                size: *size,
+                lost: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stats_track_pacer_and_request_delays() {
+        init();
+        let mut state = rtx_state();
+        let start = Instant::now();
+        state.last_push = Some(start);
+        // starts the stats interval
+        assert!(state.dequeue(&element(), start).is_empty());
+
+        let (mut seqnum, mut rtx_seqnum) = (0, 0);
+        frame_at(&mut state, &mut seqnum, 0, 3, 1000, false, start);
+        rtx_at(&mut state, &mut rtx_seqnum, &[1], start);
+        assert_eq!(
+            state
+                .dequeue(&element(), start + Duration::from_millis(50))
+                .len(),
+            4
+        );
+
+        // never given the chance to go out before going stale
+        rtx_at(
+            &mut state,
+            &mut rtx_seqnum,
+            &[2, 3],
+            start + Duration::from_millis(60),
+        );
+        state.dequeue(&element(), start + Duration::from_millis(400));
+        assert!(state.last_stats.is_none());
+
+        state.dequeue(
+            &element(),
+            start + STATS_INTERVAL + Duration::from_millis(1),
+        );
+        let stats = state.last_stats.clone().unwrap();
+        println!("{stats}");
+        assert_eq!(stats.get::<u32>("media-sent").unwrap(), 3);
+        assert_eq!(
+            stats.get::<i64>("media-pacer-delay-max-us").unwrap(),
+            50_000
+        );
+        assert_eq!(stats.get::<u32>("rtx-repair-sent").unwrap(), 1);
+        assert_eq!(
+            stats
+                .get::<i64>("rtx-repair-request-delay-mean-us")
+                .unwrap(),
+            50_000
+        );
+        assert_eq!(stats.get::<u32>("rtx-dropped-stale").unwrap(), 2);
+        assert_eq!(stats.get::<u32>("rtx-dropped-repeat").unwrap(), 0);
+        assert!(!stats.has_field("rtx-padding-pacer-delay-mean-us"));
+    }
+
+    #[test]
+    fn stats_track_the_queue_on_the_path() {
+        init();
+        let mut state = State::default();
+        sent(&mut state, &[1000, 1000, 1000, 1000]);
+        state.offset = Some(0);
+
+        // a receiver clock 1 s ahead, the path queuing 0, 5 and 30 ms, then
+        // a loss
+        let packets = [0, 5, 30]
+            .iter()
+            .enumerate()
+            .map(|(i, queue_ms)| {
+                let local_ts = i as u64 * 10_000_000;
+                Some(local_ts + 1_000_000_000 + queue_ms * 1_000_000)
+            })
+            .chain([None])
+            .enumerate()
+            .map(|(i, remote_ts)| Feedback {
+                seqnum: i as i64,
+                local_ts: i as u64 * 10_000_000,
+                remote_ts,
+                pt: 96,
+                size: 1000,
+                lost: remote_ts.is_none(),
+            })
+            .collect::<Vec<_>>();
+        state.record_feedback(&packets);
+
+        let stats = state.stats.take(Instant::now(), 0, 0, 0);
+        println!("{stats}");
+        assert_eq!(stats.get::<u32>("media-reported").unwrap(), 4);
+        assert_eq!(stats.get::<u32>("media-lost").unwrap(), 1);
+        assert_eq!(
+            stats.get::<i64>("media-network-delay-max-us").unwrap(),
+            30_000
+        );
+        assert_eq!(
+            stats.get::<i64>("media-network-delay-mean-us").unwrap(),
+            11_667
+        );
+    }
+
+    #[test]
+    fn feedback_lines_up_with_sent_packets() {
+        let mut state = State::default();
+        sent(&mut state, &[100, 1188, 1188, 1188, 500, 200, 1188, 300]);
+
+        // numbered from 0, as rtpsession does
+        assert_eq!(state.find_offset(&feedback(2, &[1188, 1188, 500])), Some(0));
+
+        // rtpsession numbered 3 packets the pacer never saw
+        assert_eq!(
+            state.find_offset(&feedback(7, &[1188, 1188, 500, 200])),
+            Some(5)
+        );
+
+        // nothing like it was sent
+        assert_eq!(state.find_offset(&feedback(0, &[42, 43])), None);
+    }
+
+    #[test]
+    fn seqnums_extend_across_wraparound() {
+        let mut state = State::default();
+        assert_eq!(state.extend_seqnum(65534), 65534);
+        assert_eq!(state.extend_seqnum(1), 65537);
+        // late feedback for a packet before the wrap
+        assert_eq!(state.extend_seqnum(65535), 65535);
+        assert_eq!(state.extend_seqnum(2), 65538);
+    }
+}
